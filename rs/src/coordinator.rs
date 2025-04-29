@@ -393,7 +393,7 @@ impl Coordinator {
           JobDetails {
             id: def.lineage_id,
             name: def.request.name.clone(),
-            schedule: def.request.weekday_times.clone(),
+            schedule: def.request.schedule.clone(),
             max_retries: def.request.max_retries,
             retry_count: def.request.retry_count,
             next_run_instance: def.current_instance_id,

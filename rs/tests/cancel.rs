@@ -17,9 +17,9 @@ async fn run_cancellation_test(pq_type: PriorityQueueType) {
   let scheduler = build_scheduler(1, pq_type).unwrap();
   let executed = Arc::new(AtomicBool::new(false));
 
-  // Schedule far in the future
-  let mut req = RecurringJobRequest::new("Cancel Me", vec![], 0);
-  req.with_initial_run_time(Utc::now() + ChronoDuration::seconds(10)); // 10 seconds out
+  // Use `never` schedule, rely on initial run time for scheduling the single event
+  let mut req = RecurringJobRequest::never("Cancel Me", 0);
+  req.with_initial_run_time(Utc::now() + ChronoDuration::seconds(10)); 
 
   let job_id = scheduler
     .add_job_async(req, job_exec_flag(executed.clone(), StdDuration::ZERO))

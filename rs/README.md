@@ -1,18 +1,21 @@
 # TurnKeeper
 
-[![Crates.io](https://img.shields.io/crates/v/turnkeeper.svg)](https://crates.io/crates/turnkeeper) <!-- TODO: Replace with actual badge once published -->
-[![Docs.rs](https://docs.rs/turnkeeper/badge.svg)](https://docs.rs/turnkeeper) <!-- TODO: Replace with actual badge once published -->
+[![Crates.io](https://img.shields.io/crates/v/turnkeeper.svg)](https://crates.io/crates/turnkeeper)
+[![Docs.rs](https://docs.rs/turnkeeper/badge.svg)](https://docs.rs/turnkeeper)
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL--2.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
-[![Build Status](https://github.com/your_username/turnkeeper/actions/workflows/rust.yml/badge.svg)](https://github.com/your_username/turnkeeper/actions/workflows/rust.yml) <!-- TODO: Replace with your repo URL -->
 
-TurnKeeper is a flexible, asynchronous recurring job scheduler for Rust built on Tokio. It allows scheduling tasks based on specific weekdays and times, handles retries with exponential backoff, supports job cancellation, and provides observability through metrics and state querying.
+TurnKeeper is a flexible, asynchronous recurring job scheduler for Rust built on Tokio. It allows scheduling tasks based on various time specifications, handles retries with exponential backoff, supports job cancellation, and provides observability through metrics and state querying.
 
 It uses a central coordinator task and a configurable pool of worker tasks, communicating via efficient asynchronous channels.
 
 ## Features
 
-*   **Time-Based Scheduling:** Schedule jobs to run at specific `(Weekday, NaiveTime)` combinations (times interpreted as UTC).
-*   **Recurring & One-Time Jobs:** Supports both recurring schedules and jobs designed to run only once (by providing an empty schedule and using `with_initial_run_time`).
+*   **Flexible Scheduling:** Schedule jobs using:
+    *   Multiple `(Weekday, NaiveTime)` pairs (UTC) via `from_week_day`.
+    *   Standard CRON expressions (UTC interpretation) via `from_cron`. Requires the `cron` crate.
+    *   Fixed intervals (e.g., every 5 minutes) via `from_interval`.
+    *   One-time execution at a specific `DateTime<Utc>` via `from_once`.
+    *   No automatic scheduling via `never` (requires explicit trigger or initial run time).
 *   **Configurable Retries:** Set maximum retry attempts for failed jobs with exponential backoff.
 *   **Concurrent Execution:** Run multiple jobs concurrently using a configurable worker pool (`max_workers`).
 *   **Flexible Scheduling Backend:** Choose between:
@@ -22,7 +25,7 @@ It uses a central coordinator task and a configurable pool of worker tasks, comm
 *   **Non-Blocking Submission:** `try_add_job` provides backpressure signaling if the internal buffer is full, returning `Err(SubmitError::StagingFull)`.
 *   **Job Cancellation:** Request cancellation of job lineages via `cancel_job`. Operation is idempotent.
 *   **Observability:**
-    *   Query job details (`get_job_details`) and list summaries (`list_all_jobs`).
+    *   Query job details (`get_job_details`) and list summaries (`list_all_jobs`). See [`JobDetails`](https://docs.rs/turnkeeper/latest/turnkeeper/struct.JobDetails.html) which includes the `Schedule` type. <!-- TODO: Update docs link -->
     *   Retrieve internal metrics snapshots (`get_metrics_snapshot`). See [`MetricsSnapshot`](https://docs.rs/turnkeeper/latest/turnkeeper/struct.MetricsSnapshot.html) for available counters/gauges. <!-- TODO: Update docs link -->
     *   Integrates with the `tracing` ecosystem for detailed logging.
 *   **Graceful & Forced Shutdown:** Control scheduler termination with optional timeouts.
@@ -35,21 +38,40 @@ Add TurnKeeper and its core dependencies to your `Cargo.toml`:
 [dependencies]
 turnkeeper = "0.1.0" # TODO: Replace with the actual desired version
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] } # Tokio is required
-chrono = "0.4" # For time/date handling
-uuid = { version = "1", features = ["v4"] } # For job IDs
+chrono = { version = "0.4", features = ["serde"] } # For time/date handling & Serde support in job types
+uuid = { version = "1", features = ["v4", "serde"] } # For job IDs & Serde support
+
+# Required for Cron scheduling and potentially other features
+cron = "0.12" # Or latest compatible version
 
 # Optional, but recommended for logging/debugging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Required if using PriorityQueueType::HandleBased (default)
-priority-queue = "1.3"
+priority-queue = "1.3" # Or latest compatible version
+
+# Optional for serde support in job detail/summary structs
+serde = { version = "1.0", features = ["derive"], optional = true }
+
+[features]
+default = []
+# Enable this feature if you need JobDetails/JobSummary serialization
+serde = ["dep:serde", "chrono/serde", "uuid/serde"]
 ```
+
+*Ensure you have the necessary Tokio features enabled for your application.*
+*Add the `cron` crate.*
+*Enable the `serde` feature if you need serialization for query results.*
 
 ## Quick Start Example
 
 ```rust
-use turnkeeper::{TurnKeeper, job::RecurringJobRequest, scheduler::PriorityQueueType};
+use turnkeeper::{
+    TurnKeeper,
+    job::RecurringJobRequest,
+    scheduler::PriorityQueueType
+};
 use chrono::{Duration as ChronoDuration, NaiveTime, Utc, Weekday};
 use std::time::Duration as StdDuration;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -84,28 +106,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // 3. Define the job request (runs shortly from now)
-    let now = Utc::now();
-    let schedule_time = (now + ChronoDuration::seconds(2)).time();
-    let job_req = RecurringJobRequest::new(
-        "Simple Recurring Job",
-        vec![(now.weekday(), schedule_time)], // Schedule for today, ~2s from now
+    // 3. Define job requests using different schedules
+    let mut job_req_once = RecurringJobRequest::from_once(
+        "Run Once Job",
+        Utc::now() + ChronoDuration::seconds(2),
         1 // Allow 1 retry on failure
     );
 
-    // 4. Submit the job (using async variant)
-    info!("Submitting job...");
-    match scheduler.add_job_async(job_req, job_fn).await {
-        Ok(job_id) => info!("Job submitted with ID: {}", job_id),
-        Err(e) => {
-             error!("Failed to submit job: {:?}", e); // Use manual debug for SubmitError
-             return Err("Job submission failed".into());
-        }
+    let job_req_interval = RecurringJobRequest::from_interval(
+        "Interval Job",
+        StdDuration::from_secs(5), // Run every 5 seconds
+        0
+    );
+    // Interval job's first run will be calculated ~5s from submission unless overridden:
+    // job_req_interval.with_initial_run_time(Utc::now() + ChronoDuration::seconds(1));
+
+
+    // 4. Submit the jobs (using async variant)
+    info!("Submitting jobs...");
+    match scheduler.add_job_async(job_req_once, job_fn.clone()).await { // Clone job_fn if reused
+        Ok(job_id) => info!("Once job submitted with ID: {}", job_id),
+        Err(e) => error!("Failed to submit Once job: {:?}", e),
+    }
+    match scheduler.add_job_async(job_req_interval, job_fn).await {
+        Ok(job_id) => info!("Interval job submitted with ID: {}", job_id),
+        Err(e) => error!("Failed to submit Interval job: {:?}", e),
     }
 
+
     // 5. Let the scheduler run for a while
-    info!("Waiting for job to run (approx 5 seconds)...");
-    tokio::time::sleep(StdDuration::from_secs(5)).await;
+    info!("Waiting for jobs to run (approx 10 seconds)...");
+    tokio::time::sleep(StdDuration::from_secs(10)).await;
 
     // 6. Query metrics (optional)
     match scheduler.get_metrics_snapshot().await {
@@ -136,13 +167,17 @@ Use `TurnKeeper::builder()` to configure the scheduler before starting it via `.
 
 ## Defining Jobs (`RecurringJobRequest`)
 
-Create a `RecurringJobRequest` using [`RecurringJobRequest::new()`](https://docs.rs/turnkeeper/latest/turnkeeper/struct.RecurringJobRequest.html#method.new): <!-- TODO: Update docs link -->
+Create a `RecurringJobRequest` using specific constructors:
 
-*   **`name`**: A `&str` for logging/identification.
-*   **`weekday_times`**: A `Vec<(chrono::Weekday, chrono::NaiveTime)>` specifying the UTC schedule. An empty `Vec` requires using `.with_initial_run_time()` for the job to run even once.
-*   **`max_retries`**: `u32` specifying retries on failure (job function returned `false` or panicked). `0` means no retries.
+*   **`from_week_day(...)`**: Takes `name`, `Vec<(Weekday, NaiveTime)>` (schedule), `max_retries`. Schedule is UTC.
+*   **`from_cron(...)`**: Takes `name`, `&str` (cron expression), `max_retries`. Requires `cron` crate.
+*   **`from_interval(...)`**: Takes `name`, `std::time::Duration` (interval), `max_retries`. Interval starts after the previous scheduled/run time.
+*   **`from_once(...)`**: Takes `name`, `DateTime<Utc>` (run time), `max_retries`.
+*   **`never(...)`**: Takes `name`, `max_retries`. Job has no automatic schedule.
 
-Use `.with_initial_run_time(DateTime<Utc>)` to set a specific first execution time. This is necessary for one-off jobs and overrides the schedule calculation for the very first run of recurring jobs.
+Use `.with_initial_run_time(DateTime<Utc>)` to set a specific first execution time. This overrides the schedule calculation for the *first* run and is required for `Schedule::Never` jobs to run at all.
+
+The schedule type itself is defined by the [`Schedule` enum](https://docs.rs/turnkeeper/latest/turnkeeper/job/enum.Schedule.html). <!-- TODO: Update docs link -->
 
 ## Job Function (`BoxedExecFn`)
 
@@ -167,9 +202,9 @@ type BoxedExecFn = Box<
 
 See the [API Reference Documentation](API_REFERENCE.md) (or link to docs.rs) for full details. <!-- TODO: Link API Ref -->
 
-*   `add_job_async` / `try_add_job`: Submit jobs, returns `Result<RecurringJobId, SubmitError>`.
+*   `add_job_async` / `try_add_job`: Submit jobs using `RecurringJobRequest`, returns `Result<RecurringJobId, SubmitError>`.
 *   `cancel_job`: Request lineage cancellation by `RecurringJobId`.
-*   `get_job_details` / `list_all_jobs`: Query job status by `RecurringJobId` or list all.
+*   `get_job_details` / `list_all_jobs`: Query job status by `RecurringJobId` or list all. Returns details including the `Schedule`.
 *   `get_metrics_snapshot`: Get performance counters and gauges.
 *   `shutdown_graceful` / `shutdown_force`: Control termination with optional timeout.
 

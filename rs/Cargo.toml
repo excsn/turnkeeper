@@ -1,8 +1,8 @@
 [package]
 name = "turnkeeper"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
-description = "An asynchronous, recurring job scheduler for Tokio with cron-like (weekday/time) scheduling, retries, observability and flexible backends."
+description = "An asynchronous, recurring job scheduler for Tokio with support for CRON, interval, and weekday/time schedules, plus retries, cancellation, and observability."
 
 authors = ["Excerion Sun <dev@excsn.com>", "Norm O <normo.pub@gmail.com>"]
 readme = "README.md"
@@ -14,8 +14,9 @@ categories = ["asynchronous", "concurrency", "date-and-time", "network-programmi
 
 [dependencies]
 async-channel = "^2"
-chrono = { version = "0.4", features = ["serde"] }
-futures = "0.3"
+chrono = { version = "^0.4", features = ["serde"] }
+cron = "^0.12"
+futures = "^0.3"
 priority-queue = "^2"
 serde = { version = "1.0", features = ["derive"], optional = true }
 thiserror = "^2"

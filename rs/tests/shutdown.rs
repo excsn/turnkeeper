@@ -3,7 +3,7 @@
 
 mod common;
 
-use crate::common::{build_scheduler, job_exec_flag, setup_tracing};
+use crate::common::{build_scheduler, setup_tracing};
 use chrono::{Duration as ChronoDuration, Utc};
 use std::time::{Duration as StdDuration, Instant};
 use std::{
@@ -15,7 +15,7 @@ use std::{
   },
 };
 use tracing::{info, warn};
-use turnkeeper::{job::RecurringJobRequest, scheduler::PriorityQueueType, TurnKeeper};
+use turnkeeper::{job::RecurringJobRequest, scheduler::PriorityQueueType};
 
 #[tokio::test]
 async fn test_graceful_shutdown_waits_for_job() {
@@ -44,8 +44,7 @@ async fn test_graceful_shutdown_waits_for_job() {
     }
   };
 
-  let mut req = RecurringJobRequest::new("Graceful Wait", vec![], 0);
-  req.with_initial_run_time(Utc::now() + ChronoDuration::milliseconds(100));
+  let req = RecurringJobRequest::from_once("Graceful Wait", Utc::now() + ChronoDuration::milliseconds(100), 0);
 
   scheduler
     .add_job_async(req, job_fn)
@@ -117,8 +116,8 @@ async fn test_force_shutdown_interrupts() {
     }
   };
 
-  let mut req = RecurringJobRequest::new("Force Interrupt", vec![], 0);
-  req.with_initial_run_time(Utc::now() + ChronoDuration::milliseconds(100));
+  let run_time = Utc::now() + ChronoDuration::milliseconds(100);
+  let req = RecurringJobRequest::from_once("Force Interrupt", run_time, 0);
 
   scheduler
     .add_job_async(req, job_fn)
@@ -130,7 +129,7 @@ async fn test_force_shutdown_interrupts() {
   info!("Initiating force shutdown while job running...");
   let shutdown_start = Instant::now();
   // Use a short timeout, expecting it to return relatively quickly
-  let shutdown_result = scheduler
+  let _shutdown_result = scheduler
     .shutdown_force(Some(StdDuration::from_secs(1)))
     .await;
   let shutdown_duration = shutdown_start.elapsed();

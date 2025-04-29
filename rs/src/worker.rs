@@ -1,18 +1,13 @@
 use crate::command::{ShutdownMode, WorkerOutcome};
-use crate::job::{BoxedExecFn, InstanceId, JobDefinition, RecurringJobId, RecurringJobRequest};
+use crate::job::{BoxedExecFn, InstanceId, JobDefinition, RecurringJobId, RecurringJobRequest, WorkerId};
 use crate::metrics::SchedulerMetrics;
 use async_channel;
 use std::collections::HashMap;
-use std::future::Future;
-use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::runtime::Handle;
 use tokio::sync::{mpsc, watch, RwLock};
-use tracing::{debug, error, info, warn, Instrument, Span};
-use uuid::Uuid;
+use tracing::{debug, error, info, warn, Instrument};
 
 /// Represents a worker task responsible for executing jobs.
 ///
@@ -20,7 +15,7 @@ use uuid::Uuid;
 /// execute the job's function, handle panics, calculate reschedule/retry logic,
 /// and report the outcome back to the Coordinator.
 pub(crate) struct Worker {
-  id: usize, // Simple numeric ID for logging
+  id: WorkerId, // Simple numeric ID for logging
   job_definitions: Arc<RwLock<HashMap<RecurringJobId, JobDefinition>>>,
   metrics: SchedulerMetrics,
   shutdown_rx: watch::Receiver<Option<ShutdownMode>>,
@@ -311,7 +306,7 @@ impl Worker {
     result: Result<bool, ()>,              // Ok(true)=success, Ok(false)=fail, Err=panic
   ) {
     let should_retry = !matches!(result, Ok(true)); // Retry on panic or explicit false
-    let mut current_retry_count = original_request.retry_count;
+    let current_retry_count = original_request.retry_count;
 
     let outcome: WorkerOutcome;
 

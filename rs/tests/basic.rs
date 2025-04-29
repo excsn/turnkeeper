@@ -3,14 +3,16 @@
 
 mod common;
 
-use crate::common::{build_scheduler, job_exec_counter_result, job_exec_flag, setup_tracing};
-use chrono::{Datelike, Duration as ChronoDuration, Utc};
 use std::sync::{
   atomic::{AtomicBool, AtomicUsize, Ordering},
   Arc,
 };
 use std::time::Duration as StdDuration;
-use turnkeeper::{job::RecurringJobRequest, scheduler::PriorityQueueType, TurnKeeper};
+
+use crate::common::{build_scheduler, job_exec_counter_result, job_exec_flag, setup_tracing};
+use chrono::{Duration as ChronoDuration, Utc};
+
+use turnkeeper::{job::RecurringJobRequest, scheduler::PriorityQueueType, TurnKeeper, Schedule};
 
 #[tokio::test]
 async fn test_one_time_job() {
@@ -18,8 +20,8 @@ async fn test_one_time_job() {
   let scheduler = build_scheduler(1, PriorityQueueType::BinaryHeap).unwrap();
   let executed = Arc::new(AtomicBool::new(false));
 
-  let mut req = RecurringJobRequest::new("One Time", vec![], 0);
-  req.with_initial_run_time(Utc::now() + ChronoDuration::milliseconds(150)); // Schedule soon
+  let run_time = Utc::now() + ChronoDuration::milliseconds(150);
+  let req = RecurringJobRequest::from_once("One Time", run_time, 0);
 
   let job_id = scheduler
     .add_job_async(req, job_exec_flag(executed.clone(), StdDuration::ZERO))
@@ -36,26 +38,26 @@ async fn test_one_time_job() {
     "One time job should have no next run time after completion"
   );
 
+  assert!(
+    matches!(details.schedule, Schedule::Once(_)),
+    "Schedule type should be Once"
+  );
+
   scheduler.shutdown_graceful(None).await.unwrap();
 }
 
 #[tokio::test]
-async fn test_simple_recurring_job() {
+async fn test_simple_interval_job() {
   setup_tracing();
   let scheduler = build_scheduler(1, PriorityQueueType::HandleBased).unwrap();
   let counter = Arc::new(AtomicUsize::new(0));
 
-  // Schedule to run every second for a short period (using initial run time)
+  // Schedule to run roughly every 500ms using interval
+  let interval = StdDuration::from_millis(500);
+  let mut req = RecurringJobRequest::from_interval("Interval Basic", interval, 0);
+  // Start the first run very soon
   let start_time = Utc::now() + ChronoDuration::milliseconds(100);
-  // HACK: Simulate recurring by setting initial time and letting calculate_next_run work.
-  // A real test might need to wait longer or define a proper schedule.
-  // Let's define a schedule for today that should trigger multiple times quickly.
-  let now_time = start_time.time();
-  let schedule = vec![(start_time.weekday(), now_time)];
-
-  let mut req =
-    RecurringJobRequest::new("Recurring Basic", schedule, 0);
-    req.with_initial_run_time(start_time); // Ensure it starts soon
+  req.with_initial_run_time(start_time);
 
   let job_id = scheduler
     .add_job_async(
@@ -80,7 +82,12 @@ async fn test_simple_recurring_job() {
   let details = scheduler.get_job_details(job_id).await.unwrap();
   assert!(
     details.next_run_time.is_some(),
-    "Recurring job should still be scheduled"
+    "Interval job should still be scheduled"
+  );
+
+  assert!(
+    matches!(details.schedule, Schedule::FixedInterval(dur) if dur == interval),
+    "Schedule type should be FixedInterval with correct duration"
   );
 
   scheduler.shutdown_graceful(None).await.unwrap();
@@ -101,12 +108,11 @@ async fn test_job_submission_backpressure() {
   let flag2 = Arc::new(AtomicBool::new(false));
   let flag3 = Arc::new(AtomicBool::new(false));
 
-  let mut req1 = RecurringJobRequest::new("BP Job 1", vec![], 0);
+  // Schedule type doesn't matter here, use `never` for simplicity
+  let mut req1 = RecurringJobRequest::never("BP Job 1", 0);
   req1.with_initial_run_time(Utc::now() + ChronoDuration::seconds(1));
-  let mut req2 = RecurringJobRequest::new("BP Job 2", vec![], 0);
-  req1.with_initial_run_time(Utc::now() + ChronoDuration::seconds(1));
-  let mut req3 = RecurringJobRequest::new("BP Job 3", vec![], 0);
-  req1.with_initial_run_time(Utc::now() + ChronoDuration::seconds(1));
+  let req2 = RecurringJobRequest::never("BP Job 2", 0);
+  let req3 = RecurringJobRequest::never("BP Job 3", 0);
 
   // Submit first job - should succeed
   let res1 = scheduler.try_add_job(req1, job_exec_flag(flag1.clone(), StdDuration::ZERO));

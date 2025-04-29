@@ -27,8 +27,9 @@ async fn test_max_worker_limit() {
 
   info!("Submitting {} jobs concurrently...", job_count);
   for i in 0..job_count {
-    let mut req = RecurringJobRequest::new(&format!("Conc Job {}", i), vec![], 0);
-    req.with_initial_run_time(Utc::now() + ChronoDuration::milliseconds(50)); // Start ASAP
+    // Use `never` schedule, rely on initial run time
+    let mut req = RecurringJobRequest::never(&format!("Conc Job {}", i), 0);
+    req.with_initial_run_time(Utc::now() + ChronoDuration::milliseconds(50));
 
     let job_fn =
       job_exec_concurrency_tracker(active_counter.clone(), max_observed.clone(), job_delay);

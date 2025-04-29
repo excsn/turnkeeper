@@ -6,13 +6,12 @@
 //! - Letting the job run once or twice.
 //! - Graceful shutdown.
 
-use chrono::{Duration as ChronoDuration, NaiveTime, Utc, Weekday}; // Added Utc, Weekday
+use chrono::{Duration as ChronoDuration, Utc};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tracing::{error, info};
 use turnkeeper::{job::RecurringJobRequest, scheduler::PriorityQueueType, TurnKeeper};
-use uuid::Uuid; // Assuming job_id usage might be added later // Use tracing macros
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -34,12 +33,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
   // --- Define Job ---
   // Schedule it to run ~2 seconds from now using with_initial_run_time
-  let mut job_req = RecurringJobRequest::new(
+  let job_req = RecurringJobRequest::from_once(
     "Simple RunOnce Job", // Renamed for clarity
-    vec![],               // Still empty schedule for one-time run
+    Utc::now() + ChronoDuration::seconds(2),
     1,                    // Retries don't matter much here
   );
-  job_req.with_initial_run_time(Utc::now() + ChronoDuration::seconds(2)); // Set explicit start
 
   let exec_count_clone = execution_count.clone();
   let job_fn = move || {

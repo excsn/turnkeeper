@@ -39,8 +39,8 @@ async fn test_retry_scheduling_on_failure() {
     }
   };
 
-  let mut req = RecurringJobRequest::new("Retry Schedule Test", vec![], max_retries);
-  // Schedule initial run very soon
+  // Use `never` schedule, rely on initial run time
+  let mut req = RecurringJobRequest::never("Retry Schedule Test", max_retries);
   let initial_run_time = Utc::now() + ChronoDuration::milliseconds(50);
   req.with_initial_run_time(initial_run_time);
 
@@ -100,7 +100,7 @@ async fn test_permanent_failure_scheduling() {
   let counter = Arc::new(AtomicUsize::new(0));
   let max_retries = 1; // Only 1 retry allowed
 
-  let mut req = RecurringJobRequest::new("Perm Failure Schedule", vec![], max_retries);
+  let mut req = RecurringJobRequest::never("Perm Failure Schedule", max_retries);
   let initial_run_time = Utc::now() + ChronoDuration::milliseconds(50);
   req.with_initial_run_time(initial_run_time);
 
@@ -150,7 +150,8 @@ async fn test_panic_retry_scheduling() {
   let scheduler = build_scheduler(1, PriorityQueueType::HandleBased).unwrap();
   let max_retries = 1;
 
-  let mut req = RecurringJobRequest::new("Panic Schedule Test", vec![], max_retries);
+  // Use `never` schedule, rely on initial run time
+  let mut req = RecurringJobRequest::never("Panic Schedule Test", max_retries);
   let initial_run_time = Utc::now() + ChronoDuration::milliseconds(50);
   req.with_initial_run_time(initial_run_time);
 

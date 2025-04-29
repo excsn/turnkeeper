@@ -29,15 +29,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
   // --- Define Job ---
   // Create request with an EMPTY schedule
-  let mut job_req = RecurringJobRequest::new(
+  let run_time = Utc::now() + ChronoDuration::seconds(2);
+  let job_req = RecurringJobRequest::from_once(
     "One Time Job",
-    vec![], // <-- Empty schedule means no automatic rescheduling
+    run_time,
     0,      // No retries needed for this example
   );
 
-  // Manually set the specific time for the single execution
-  let run_time = Utc::now() + ChronoDuration::seconds(2); // Schedule ~2 seconds from now
-  job_req.with_initial_run_time(run_time); // Chain the method call
   info!("Job scheduled for one-time run at: {}", run_time);
 
   let flag_clone = job_executed_flag.clone();

@@ -1,35 +1,46 @@
+// file: rs/src/lib.rs
 //! TurnKeeper: A Flexible Recurring Job Scheduler
 //!
 //! Provides a flexible scheduler for running recurring tasks based on weekday/time schedules,
-//! with support for retries, configurable scheduling mechanisms, metrics, and querying.
+//! CRON expressions, or fixed intervals, with support for retries, configurable scheduling
+//! mechanisms, metrics, querying, and cancellation.
 //!
 //! # Features
 //!
-//! - Schedule jobs based on multiple `(Weekday, NaiveTime)` pairs.
+//! - Schedule jobs using:
+//!   - Multiple `(Weekday, NaiveTime)` pairs (UTC).
+//!   - Standard CRON expressions (UTC interpretation, requires `cron` crate).
+//!   - Fixed intervals (e.g., every 5 minutes).
+//!   - One-time execution at a specific `DateTime<Utc>`.
 //! - Configurable maximum retry attempts with exponential backoff.
 //! - Choice of scheduling backend via the builder:
 //!   - `BinaryHeap`: Standard library, lazy cancellation check.
 //!   - `HandleBased`: Supports proactive cancellation removal and future job updates.
 //! - Non-blocking job submission (`try_add_job`) with backpressure signaling.
 //! - Asynchronous job submission (`add_job_async`).
-//! - Query job details and list all jobs.
-//! - Built-in metrics collection (queryable snapshot).
+//! - Query job details (`JobDetails`) and list summaries (`JobSummary`).
+//! - Built-in metrics collection (queryable snapshot using `MetricsSnapshot`).
 //! - Graceful and forced shutdown procedures (with optional timeout).
 //! - Cancellation of job lineages.
 //!
 //! # Usage
 //!
 //! ```no_run
-//! use turnkeeper::{TurnKeeper, job::RecurringJobRequest, scheduler::PriorityQueueType};
-//! use chrono::{NaiveTime, Weekday, Duration as ChronoDuration}; // Use ChronoDuration alias
-//! use std::time::Duration as StdDuration; // Use StdDuration alias
+//! use turnkeeper::{
+//!     TurnKeeper,
+//!     job::{RecurringJobRequest, Schedule}, // Import Schedule if using directly
+//!     scheduler::PriorityQueueType
+//! };
+//! use chrono::{NaiveTime, Weekday, Duration as ChronoDuration, Utc};
+//! use std::time::Duration as StdDuration;
 //! use std::sync::atomic::{AtomicUsize, Ordering};
 //! use std::sync::Arc;
+//! use uuid::Uuid; // Import Uuid if storing IDs
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     // Basic tracing setup (optional)
-//!     // tracing_subscriber::fmt::init();
+//!     // tracing_subscriber::fmt().with_env_filter("warn,turnkeeper=info").init();
 //!
 //!     println!("Building scheduler...");
 //!     let scheduler = TurnKeeper::builder()
@@ -39,16 +50,33 @@
 //!     println!("Scheduler built.");
 //!
 //!     let job_counter = Arc::new(AtomicUsize::new(0));
-//!     let job_id_store = Arc::new(tokio::sync::Mutex::new(None::<uuid::Uuid>));
+//!     let job_id_store = Arc::new(tokio::sync::Mutex::new(None::<Uuid>));
 //!
-//!     // --- Add a job ---
-//!     let mut job_req = RecurringJobRequest::new(
+//!     // --- Add a job (Example using WeekdayTimes via helper) ---
+//!     // This job has no recurring schedule defined here, will only run once via with_initial_run_time
+//!     let mut job_req = RecurringJobRequest::from_week_day(
 //!         "Counter Job",
-//!         vec![], // No recurring schedule for this simple example
+//!         vec![], // No specific weekdays/times defined
 //!         3 // Max retries
 //!     );
-//!     // Schedule to run very soon for demonstration
-//!     job_req.with_initial_run_time(chrono::Utc::now() + ChronoDuration::seconds(1));
+//!     // Schedule the *first* run explicitly
+//!     job_req.with_initial_run_time(Utc::now() + ChronoDuration::seconds(1));
+//!
+//!     // --- Add an interval job ---
+//!     let interval_req = RecurringJobRequest::from_interval(
+//!         "Interval Job",
+//!         StdDuration::from_secs(30), // Run every 30 seconds
+//!         1 // Max retries
+//!     );
+//!     // First run will be calculated as Now + Interval by the scheduler,
+//!     // or you could use with_initial_run_time() to set a specific start.
+//!
+//!     // --- Add a CRON job (runs every minute) ---
+//!      let cron_req = RecurringJobRequest::from_cron(
+//!          "Cron Job",
+//!          "0 * * * * * *", // Every minute at second 0 (adjust as needed)
+//!          0
+//!      );
 //!
 //!     let counter_clone = job_counter.clone();
 //!     let id_store_clone = job_id_store.clone();
@@ -63,28 +91,43 @@
 //!         }) as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
 //!     };
 //!
-//!     println!("Submitting job...");
-//!     // Use try_add_job (non-blocking) or add_job_async (waits if full)
-//!     match scheduler.try_add_job(job_req.clone(), exec_fn) {
+//!     println!("Submitting Counter job...");
+//!     match scheduler.try_add_job(job_req.clone(), exec_fn) { // Clone exec_fn if reused
 //!          Ok(job_id) => {
-//!              println!("Job submitted successfully with ID: {}", job_id);
+//!              println!("Counter Job submitted successfully with ID: {}", job_id);
 //!              let mut locked_id = id_store_clone.lock().await;
 //!              *locked_id = Some(job_id); // Store the ID for later use
 //!          },
 //!          Err(e) => {
-//!              eprintln!("Failed to submit job initially: {:?}", e);
+//!              eprintln!("Failed to submit counter job initially: {:?}", e);
 //!              // Handle staging buffer full error (e.g., retry later)
 //!          }
 //!     }
 //!
+//!     // Submit the interval job
+//!     match scheduler.add_job_async(interval_req, || Box::pin(async {
+//!         println!("Interval Job Executing!"); true
+//!         })).await {
+//!         Ok(id) => println!("Interval Job submitted with ID: {}", id),
+//!         Err(e) => eprintln!("Failed to submit interval job: {:?}", e),
+//!     }
 //!
-//!     // --- Wait for job to potentially run ---
-//!     tokio::time::sleep(StdDuration::from_secs(2)).await;
+//!     // Submit the CRON job
+//!      match scheduler.add_job_async(cron_req, || Box::pin(async {
+//!          println!("Cron Job Executing!"); true
+//!          })).await {
+//!          Ok(id) => println!("Cron Job submitted with ID: {}", id),
+//!          Err(e) => eprintln!("Failed to submit cron job: {:?}", e),
+//!      }
+//!
+//!
+//!     // --- Wait for jobs to potentially run ---
+//!     tokio::time::sleep(StdDuration::from_secs(5)).await;
 //!
 //!     // --- Query Metrics ---
 //!     println!("Querying metrics...");
 //!     match scheduler.get_metrics_snapshot().await {
-//!         Ok(metrics) => println!("Current Metrics: {:?}", metrics),
+//!         Ok(metrics) => println!("Current Metrics: {:#?}", metrics), // Pretty print metrics
 //!         Err(e) => eprintln!("Failed to get metrics: {:?}", e),
 //!     }
 //!
@@ -100,6 +143,11 @@
 //!         println!("Job ID not stored, skipping cancellation.")
 //!     }
 //!
+//!     // --- Query Details of a specific job ---
+//!     // (Replace with a known ID from submitting interval/cron job)
+//!     // if let Ok(details) = scheduler.get_job_details(known_interval_job_id).await {
+//!     //     println!("Interval Job Details: {:#?}", details);
+//!     // }
 //!
 //!     // --- Shutdown ---
 //!     println!("Requesting graceful shutdown...");
@@ -108,7 +156,6 @@
 //!         Ok(()) => println!("Scheduler shut down complete."),
 //!         Err(e) => eprintln!("Shutdown failed: {:?}", e),
 //!     }
-//!
 //!
 //!     Ok(())
 //! }
@@ -123,8 +170,9 @@
 //!
 //! # Job Lifecycle & State
 //!
-//! - Jobs are defined by [`RecurringJobRequest`].
-//! - The scheduler manages job state internally, including retry counts and the next scheduled run time.
+//! - Jobs are defined by [`RecurringJobRequest`], specifying the schedule type via [`Schedule`].
+//! - Use constructors like `from_week_day`, `from_cron`, `from_interval`, `from_once`, `never`.
+//! - The scheduler manages job state internally, including retry counts and the next scheduled run time (`next_run_time` in `JobDetails`).
 //! - Workers execute job functions (`BoxedExecFn`).
 //! - Job outcomes (success, failure, panic) trigger rescheduling or permanent failure logic.
 //! - Cancellation marks a job lineage; its handling depends on the chosen `PriorityQueueType`.
@@ -154,7 +202,7 @@ pub use error::{BuildError, QueryError, ShutdownError, SubmitError};
 
 // Job related types
 pub use job::{
-    BoxedExecFn, InstanceId, JobDetails, JobSummary, RecurringJobId, RecurringJobRequest,
+  BoxedExecFn, InstanceId, JobDetails, JobSummary, RecurringJobId, RecurringJobRequest, Schedule,
 };
 
 // Metrics related types (consider only exporting Snapshot for public API)
