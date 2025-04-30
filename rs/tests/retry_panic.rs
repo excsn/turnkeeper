@@ -9,7 +9,7 @@ use std::sync::{
   Arc,
 };
 use std::time::Duration as StdDuration;
-use turnkeeper::{job::RecurringJobRequest, scheduler::PriorityQueueType};
+use turnkeeper::{job::RecurringJobRequest, scheduler::PriorityQueueType, Schedule};
 
 #[tokio::test]
 async fn test_retry_scheduling_on_failure() {
@@ -180,6 +180,90 @@ async fn test_panic_retry_scheduling() {
   );
   assert!(details1.next_run_time.unwrap() > initial_run_time + ChronoDuration::seconds(50)); // Basic backoff check
   assert_eq!(metrics1.jobs_permanently_failed, 0); // Not permanently failed yet
+
+  scheduler.shutdown_graceful(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_fixed_retry_delay_scheduling() {
+  setup_tracing();
+  let scheduler = build_scheduler(1, PriorityQueueType::HandleBased).unwrap();
+  let counter = Arc::new(AtomicUsize::new(0));
+  let max_retries = 2;
+  let fixed_delay = StdDuration::from_secs(5); // Use a short, distinct fixed delay
+
+  let initial_run_time = Utc::now() + ChronoDuration::milliseconds(50);
+  let job_req = RecurringJobRequest::with_fixed_retry_delay(
+    "Fixed Retry Delay Test",
+    Schedule::Once(initial_run_time),
+    max_retries,
+    fixed_delay,
+  );
+
+  let job_id = scheduler
+    .add_job_async(
+      job_req,
+      job_exec_counter_result(counter.clone(), StdDuration::from_millis(10), false), // Always fail
+    )
+    .await
+    .expect("Add job failed");
+
+  // --- Verify First Failure and Fixed Retry Schedule ---
+  tokio::time::sleep(StdDuration::from_millis(200)).await; // Wait for first run to complete and outcome to be processed
+  let time_after_run = Utc::now(); // Capture time *after* outcome is likely processed
+
+  let metrics1 = scheduler.get_metrics_snapshot().await.unwrap();
+  let details1 = scheduler.get_job_details(job_id).await.unwrap();
+
+  assert_eq!(counter.load(Ordering::SeqCst), 1, "Should have run once");
+  assert_eq!(metrics1.jobs_executed_fail, 1, "Should fail once");
+  assert_eq!(metrics1.jobs_retried, 1, "Should schedule 1 retry");
+  assert_eq!(
+    details1.retry_count, 1,
+    "Retry count in definition should be 1 for next run"
+  );
+  assert!(
+    details1.next_run_time.is_some(),
+    "Should have a next run time scheduled"
+  );
+
+  // Verify the scheduled time is roughly fixed_delay *after* the time the worker calculated it.
+  // Since we capture time_after_run *later*, the difference between next_run and time_after_run
+  // should be slightly *less* than fixed_delay.
+
+  let next_run = details1.next_run_time.unwrap();
+  let delta_duration = next_run.signed_duration_since(time_after_run);
+
+  let expected_delay_chrono = ChronoDuration::from_std(fixed_delay).unwrap();
+  // Allow for processing time (~100-200ms) between when the worker calculated
+  // next_run and when the test captured time_after_run. The actual delta should
+  // be less than the full fixed_delay.
+  let lower_bound = expected_delay_chrono - ChronoDuration::milliseconds(300); // Allow up to 300ms diff
+  let upper_bound = expected_delay_chrono - ChronoDuration::milliseconds(10); // Must be less than full delay
+
+  tracing::debug!("Time after run: {}", time_after_run);
+  tracing::debug!("Scheduled next run: {}", next_run);
+  tracing::debug!("Delta duration: {:?}", delta_duration);
+  tracing::debug!("Expected Delay: {:?}", expected_delay_chrono);
+  tracing::debug!("Lower bound delta: {:?}", lower_bound);
+  tracing::debug!("Upper bound delta: {:?}", upper_bound);
+
+  assert!(
+    delta_duration >= lower_bound && delta_duration <= upper_bound,
+    "Delta duration ({:?}) not within expected range ({:?} to {:?}), expected ~ < {:?}",
+    delta_duration,
+    lower_bound,
+    upper_bound,
+    expected_delay_chrono
+  );
+
+  // Ensure it's NOT the exponential backoff time (which would be ~60s+)
+  // We can compare next_run relative to the original initial_run_time.
+  assert!(
+    next_run < initial_run_time + ChronoDuration::seconds(30),
+    "Retry time ({}) seems too long for fixed delay, maybe exponential?",
+    next_run
+  );
 
   scheduler.shutdown_graceful(None).await.unwrap();
 }

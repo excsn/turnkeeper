@@ -1,8 +1,18 @@
 use crate::error::QueryError;
-use crate::job::{InstanceId, JobDetails, JobSummary, RecurringJobId};
+use crate::job::{InstanceId, JobDetails, JobSummary, MaxRetries, RecurringJobId, Schedule};
 use crate::metrics::MetricsSnapshot;
+
 use chrono::{DateTime, Utc};
 use tokio::sync::oneshot;
+
+/// Data required to update a job's configuration.
+/// Fields are optional; `None` indicates no change for that field.
+#[derive(Debug, Clone)]
+pub struct JobUpdateData {
+  pub schedule: Option<Schedule>,
+  pub max_retries: Option<MaxRetries>,
+  // Add other updatable fields here later if needed
+}
 
 /// Commands sent from the `TurnKeeper` handle to the central Coordinator task.
 ///
@@ -36,18 +46,19 @@ pub(crate) enum CoordinatorCommand {
     /// `Err(QueryError::JobNotFound)` if the lineage ID was never known.
     responder: oneshot::Sender<Result<(), QueryError>>,
   },
-  // --- Potential Future Commands ---
-  // /// Request updating the schedule or parameters of a job.
-  // UpdateJob {
-  //     job_id: RecurringJobId,
-  //     new_request_data: RecurringJobRequest, // Or specific update fields
-  //     responder: oneshot::Sender<Result<(), QueryError>>,
-  // },
-  // /// Manually trigger a job to run now (if possible).
-  // TriggerJobNow {
-  //     job_id: RecurringJobId,
-  //     responder: oneshot::Sender<Result<(), QueryError>>, // Ok if scheduled, Err if not found/running etc.
-  // },
+  /// Request updating the schedule or parameters of a job.
+  /// Requires the `HandleBased` priority queue.
+  UpdateJob {
+    job_id: RecurringJobId,
+    update_data: JobUpdateData,
+    /// Channel to send the `Result<(), QueryError>` back.
+    responder: oneshot::Sender<Result<(), QueryError>>,
+  },
+  /// Manually trigger a job to run now (if possible).
+  TriggerJobNow {
+      job_id: RecurringJobId,
+      responder: oneshot::Sender<Result<(), QueryError>>, // Ok if scheduled, Err if not found/running etc.
+  },
 }
 
 /// Represents the requested shutdown mode. Sent via a `watch` channel.

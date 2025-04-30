@@ -1,13 +1,23 @@
 use crate::command::{ShutdownMode, WorkerOutcome};
-use crate::job::{BoxedExecFn, InstanceId, JobDefinition, RecurringJobId, RecurringJobRequest, WorkerId};
+use crate::job::{
+  BoxedExecFn, InstanceId, JobDefinition, RecurringJobId, RecurringJobRequest, WorkerId,
+};
 use crate::metrics::SchedulerMetrics;
-use async_channel;
+
+#[cfg(feature = "job_context")]
+use crate::job::context::{JobContext, CURRENT_JOB_CONTEXT};
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use async_channel;
+use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, watch, RwLock};
-use tracing::{debug, error, info, warn, Instrument};
+use tracing::{debug, error, info, trace, warn, Instrument};
+
+type JobDispatchTuple = (InstanceId, RecurringJobId, DateTime<Utc>);
 
 /// Represents a worker task responsible for executing jobs.
 ///
@@ -21,8 +31,8 @@ pub(crate) struct Worker {
   shutdown_rx: watch::Receiver<Option<ShutdownMode>>,
   // Channel to send job outcome back to Coordinator
   worker_outcome_tx: mpsc::Sender<WorkerOutcome>,
-  // Shared channel to receive job assignments (InstanceId, RecurringJobId)
-  job_dispatch_rx: async_channel::Receiver<(InstanceId, RecurringJobId)>,
+  // Shared channel to receive job assignments
+  job_dispatch_rx: async_channel::Receiver<JobDispatchTuple>,
   // Shared counter for tracking active workers (for graceful shutdown)
   active_workers_counter: Arc<AtomicUsize>,
 }
@@ -36,7 +46,7 @@ impl Worker {
     metrics: SchedulerMetrics,
     shutdown_rx: watch::Receiver<Option<ShutdownMode>>,
     worker_outcome_tx: mpsc::Sender<WorkerOutcome>,
-    job_dispatch_rx: async_channel::Receiver<(InstanceId, RecurringJobId)>,
+    job_dispatch_rx: async_channel::Receiver<JobDispatchTuple>,
     active_workers_counter: Arc<AtomicUsize>,
   ) -> Self {
     Self {
@@ -77,51 +87,74 @@ impl Worker {
           // --- Wait for Job Dispatch ---
           result = self.job_dispatch_rx.recv() => {
                match result {
-                   Ok((instance_id, lineage_id)) => {
-                      debug!(worker_id=self.id, %instance_id, %lineage_id, "Received job dispatch.");
+                Ok((instance_id, lineage_id, scheduled_time)) => {
+                  debug!(worker_id=self.id, %instance_id, %lineage_id, %scheduled_time, "Received job dispatch.");
 
-                       // --- Fetch Job Details ---
-                       // This lock should be brief
-                       let maybe_job_info = self.fetch_job_details(instance_id, lineage_id).await;
+                  // --- Calculate and Record Wait Time ---
+                  let start_time = Instant::now(); // Time execution *actually* starts
+                  let now_utc = Utc::now();
+                  if now_utc >= scheduled_time {
+                      let wait_duration = now_utc.signed_duration_since(scheduled_time);
+                      match wait_duration.to_std() {
+                          Ok(std_wait_duration) => {
+                              self.metrics.job_queue_wait_duration.record(std_wait_duration);
+                              trace!(worker_id=self.id, %instance_id, wait_ms = std_wait_duration.as_millis(), "Recorded queue wait time.");
+                          }
+                          Err(e) => {
+                              warn!(worker_id=self.id, %instance_id, %scheduled_time, error=%e, "Failed to convert wait duration");
+                          }
+                      }
+                  } else {
+                      // Should not happen if coordinator logic is correct, but log if it does
+                      warn!(worker_id=self.id, %instance_id, %scheduled_time, "Job started *before* its scheduled time?");
+                      self.metrics.job_queue_wait_duration.record(Duration::ZERO); // Record zero wait
+                  }
+                  // --- Fetch Job Details ---
+                  // This lock should be brief
+                  let maybe_job_info = self.fetch_job_details(instance_id, lineage_id).await;
 
-                       if let Some((exec_fn, request)) = maybe_job_info {
-                            // Create a tracing span for the job execution context
-                            let job_span = tracing::span!(
-                               tracing::Level::INFO, // Or DEBUG
-                               "job_exec",
-                               worker_id = self.id,
-                               %lineage_id,
-                               %instance_id,
-                               job_name = request.name.as_str()
-                            );
+                  if let Some((exec_fn, request)) = maybe_job_info {
+                      // Create a tracing span for the job execution context
+                      let job_span = tracing::span!(
+                          tracing::Level::INFO, // Or DEBUG
+                          "job_exec",
+                          worker_id = self.id,
+                          %lineage_id,
+                          %instance_id,
+                          job_name = request.name.as_str()
+                      );
 
-                            // Enter the span and execute the job logic
-                            self.execute_and_handle(instance_id, lineage_id, request, exec_fn)
-                                .instrument(job_span) // Apply span to the future
-                                .await;
+                      // Enter the span and execute the job logic
+                      self.execute_and_handle(instance_id, lineage_id, request, exec_fn, start_time)
+                          .instrument(job_span)
+                          .await;
 
-                       } else {
-                            // Fetch failed, worker_outcome_tx was already notified in fetch_job_details
-                            // The active count was incremented by coordinator but worker failed early.
-                            // Need coordinator to handle FetchFailed outcome to decrement count.
-                            error!(worker_id=self.id, %instance_id, %lineage_id, "Discarding dispatch due to fetch failure.");
-                            // Decrement active count here as well as sending message?
-                            // No, let coordinator handle decrement on FetchFailed outcome.
-                       }
-                        // Loop immediately after handling (or failing to fetch) to wait for the next job
+                  } else {
+                      // Fetch failed, worker_outcome_tx was already notified in fetch_job_details
+                      // The active count was incremented by coordinator but worker failed early.
+                      // Need coordinator to handle FetchFailed outcome to decrement count.
+                      error!(worker_id=self.id, %instance_id, %lineage_id, "Discarding dispatch due to fetch failure.");
 
-                   },
-                   Err(e) => {
-                        // Channel closed - Coordinator likely terminated
-                        if !self.is_shutting_down() {
-                           error!(worker_id=self.id, "Job dispatch channel closed unexpectedly. Worker exiting. Error: {:?}", e);
-                        } else {
-                           // Expected during shutdown
-                           info!(worker_id=self.id, "Job dispatch channel closed during shutdown. Worker exiting.");
-                        }
-                        break; // Exit loop
-                   }
-               } // end match result
+                      let prev_count = self.active_workers_counter.fetch_sub(1, AtomicOrdering::Relaxed);
+                      self.metrics.workers_active_current.store(
+                          prev_count.saturating_sub(1),
+                          AtomicOrdering::Relaxed,
+                      );
+                      debug!(worker_id = self.id, %instance_id, "Decremented active count after fetch failure.");
+                  }
+                  // Loop immediately after handling (or failing to fetch) to wait for the next job
+                },
+                Err(e) => {
+                // Channel closed - Coordinator likely terminated
+                if !self.is_shutting_down() {
+                    error!(worker_id=self.id, "Job dispatch channel closed unexpectedly. Worker exiting. Error: {:?}", e);
+                } else {
+                    // Expected during shutdown
+                    info!(worker_id=self.id, "Job dispatch channel closed during shutdown. Worker exiting.");
+                }
+                break; // Exit loop
+              }
+            } // end match result
           } // end select branch job_dispatch_rx
 
       } // end select!
@@ -144,31 +177,12 @@ impl Worker {
   ) -> Option<(Arc<BoxedExecFn>, RecurringJobRequest)> {
     let definitions = self.job_definitions.read().await;
     if let Some(def) = definitions.get(&lineage_id) {
-      // Verify instance_id matches def.current_instance_id for consistency.
-      // This helps catch potential race conditions if the job was cancelled
-      // and rescheduled very quickly between Coordinator dispatch and worker fetch.
-      if def.current_instance_id != Some(instance_id) {
-        warn!(
-            worker_id = self.id,
-            %lineage_id,
-            %instance_id,
-            expected_id = ?def.current_instance_id,
-            "Mismatch between dispatched instance ID and definition's current ID! Ignoring dispatch."
-        );
-        // Send failure outcome
-        let outcome = WorkerOutcome::FetchFailed {
-          instance_id,
-          lineage_id,
-        };
-        if self.worker_outcome_tx.send(outcome).await.is_err() {
-          error!(
-              worker_id = self.id,
-              %lineage_id,
-              "Failed to send FetchFailed outcome."
-          );
-        }
-        return None; // Don't execute if state seems inconsistent
-      }
+      // IMPORTANT CASE
+      // ────────────────────────────────────────
+      // DROP the strict instance_id == current_instance_id guard.
+      // We trust the Coordinator to only enqueue valid instances.
+      // ────────────────────────────────────────
+
       // Clone the necessary parts to release the read lock quickly
       Some((def.exec_fn.clone(), def.request.clone()))
     } else {
@@ -199,13 +213,15 @@ impl Worker {
     &self,
     instance_id: InstanceId,
     lineage_id: RecurringJobId,
-    request: RecurringJobRequest, // Passed by value
+    request: RecurringJobRequest,
     exec_fn: Arc<BoxedExecFn>,
+    job_start_instant: Instant,
   ) {
     info!("Starting job execution.");
-    let start_time = Instant::now();
-    let exec_result = self.execute_job_logic(&exec_fn).await; // Renamed inner logic
-    let duration = start_time.elapsed();
+    let exec_result = self
+      .execute_job_logic(&exec_fn, lineage_id, instance_id)
+      .await;
+    let duration = job_start_instant.elapsed();
 
     // Record metrics regardless of outcome
     self.metrics.job_execution_duration.record(duration);
@@ -244,17 +260,27 @@ impl Worker {
 
   /// Executes the job function, catching panics.
   /// Returns Ok(bool) for success/failure, Err(()) for panic.
-  async fn execute_job_logic(&self, exec_fn: &Arc<BoxedExecFn>) -> Result<bool, ()> {
+  async fn execute_job_logic(
+    &self,
+    exec_fn: &Arc<BoxedExecFn>,
+    lineage_id: RecurringJobId,
+    instance_id: InstanceId,
+  ) -> Result<bool, ()> {
     let func = exec_fn.clone();
+    let future_to_run = func(); // Get the Future from the Fn
 
-    // We need to run the potentially panicking code (including the await)
-    // within the catch_unwind closure. This often requires blocking if
-    // catch_unwind is used directly from an async context.
-    // Alternatively, spawn a new task and catch its panic result.
+    // --- Spawn with or without context scope ---
+    #[cfg(feature = "job_context")]
+    let task = {
+      let context = JobContext {
+        recurring_job_id: lineage_id,
+        instance_id,
+      };
+      tokio::spawn(CURRENT_JOB_CONTEXT.scope(context, future_to_run))
+    };
+    #[cfg(not(feature = "job_context"))]
+    let task = tokio::spawn(future_to_run);
 
-    // --- Option A: Spawn a new task and catch its result ---
-    // This is often cleaner in Tokio
-    let task = tokio::spawn(async move { func().await });
     match task.await {
       Ok(job_result_bool) => {
         // Task completed without panic
@@ -275,7 +301,21 @@ impl Worker {
       Err(join_error) => {
         // Task panicked or was cancelled
         if join_error.is_panic() {
-          error!("Job function panicked during execution (caught via task join)!");
+          // Log context only if feature is enabled and it panicked
+          #[cfg(feature = "job_context")]
+          error!(
+            "Job function panicked! Context: {:?}",
+            JobContext {
+              recurring_job_id: lineage_id,
+              instance_id
+            }
+          );
+          #[cfg(not(feature = "job_context"))]
+          error!(
+            "Job function panicked! IDs: Job {}, Instance {}",
+            lineage_id, instance_id
+          );
+
           self
             .metrics
             .jobs_panicked

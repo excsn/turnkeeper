@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   let job_req = RecurringJobRequest::from_once(
     "Simple RunOnce Job", // Renamed for clarity
     Utc::now() + ChronoDuration::seconds(2),
-    1,                    // Retries don't matter much here
+    1, // Retries don't matter much here
   );
 
   let exec_count_clone = execution_count.clone();

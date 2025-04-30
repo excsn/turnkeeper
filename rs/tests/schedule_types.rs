@@ -136,14 +136,31 @@ async fn test_never_schedule_no_initial_time() {
   // Check details - it should exist but have no next run
   let details_result = scheduler.get_job_details(job_id).await;
   tracing::info!(
-    "Result of get_job_details for discarded job: {:?}",
+    "Result of get_job_details for 'Never' job: {:?}",
     details_result
   );
+  // Assert that getting details SUCCEEDS
   assert!(
-    matches!(details_result, Err(QueryError::JobNotFound(id)) if id == job_id),
-    "Getting details for a discarded 'Never' job should result in JobNotFound"
+    details_result.is_ok(),
+    "Getting details for a 'Never' job should succeed."
   );
 
+  if let Ok(details) = details_result {
+    // Assert that it's not scheduled
+    assert!(
+      details.next_run_time.is_none(),
+      "Job should have no next run time"
+    );
+    assert!(
+      details.next_run_instance.is_none(),
+      "Job should have no next run instance"
+    );
+    assert!(!details.is_cancelled, "Job should not be cancelled");
+    assert!(
+      matches!(details.schedule, Schedule::Never),
+      "Schedule should be Never"
+    );
+  }
   scheduler.shutdown_graceful(None).await.unwrap();
 }
 

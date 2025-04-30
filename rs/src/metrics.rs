@@ -83,6 +83,8 @@ pub struct SchedulerMetrics {
   // --- Histograms/Summaries ---
   /// Histogram tracking the execution duration of jobs (in microseconds).
   pub job_execution_duration: Arc<SimpleHistogram>,
+  /// Histogram tracking the time jobs wait in the queue (scheduled_time to start_time) (in microseconds).
+  pub job_queue_wait_duration: Arc<SimpleHistogram>,
 }
 
 impl SchedulerMetrics {
@@ -103,6 +105,7 @@ impl SchedulerMetrics {
       job_staging_buffer_current: Default::default(),
       workers_active_current: Default::default(),
       job_execution_duration: Arc::new(SimpleHistogram::default()),
+      job_queue_wait_duration: Arc::new(SimpleHistogram::default()),
     }
   }
 
@@ -130,8 +133,10 @@ impl SchedulerMetrics {
       job_queue_scheduled_current: self.job_queue_scheduled_current.load(order),
       job_staging_buffer_current: self.job_staging_buffer_current.load(order),
       workers_active_current: self.workers_active_current.load(order),
-      job_execution_duration_count: self.job_execution_duration.get_count(), // Uses internal ordering
-      job_execution_duration_sum_micros: self.job_execution_duration.get_sum_micros(), // Uses internal ordering
+      job_execution_duration_count: self.job_execution_duration.get_count(),
+      job_execution_duration_sum_micros: self.job_execution_duration.get_sum_micros(),
+      job_queue_wait_duration_count: self.job_queue_wait_duration.get_count(),
+      job_queue_wait_duration_sum_micros: self.job_queue_wait_duration.get_sum_micros(),
     }
   }
 }
@@ -163,6 +168,8 @@ pub struct MetricsSnapshot {
   // Histogram Data
   pub job_execution_duration_count: usize,
   pub job_execution_duration_sum_micros: usize,
+  pub job_queue_wait_duration_count: usize,
+  pub job_queue_wait_duration_sum_micros: usize,
 }
 
 impl MetricsSnapshot {
@@ -183,5 +190,25 @@ impl MetricsSnapshot {
     self
       .mean_execution_duration_micros()
       .map(|micros| Duration::from_micros(micros as u64)) // Convert f64 micros back to Duration
+  }
+
+  /// Calculates the mean job queue wait duration in microseconds, if any jobs started.
+  /// Returns `None` if `job_queue_wait_duration_count` is zero.
+  pub fn mean_queue_wait_duration_micros(&self) -> Option<f64> {
+    if self.job_queue_wait_duration_count == 0 {
+      None
+    } else {
+      Some(
+        self.job_queue_wait_duration_sum_micros as f64 / self.job_queue_wait_duration_count as f64,
+      )
+    }
+  }
+
+  /// Calculates the mean job queue wait duration, if any jobs started.
+  /// Returns `None` if `job_queue_wait_duration_count` is zero.
+  pub fn mean_queue_wait_duration(&self) -> Option<Duration> {
+    self
+      .mean_queue_wait_duration_micros()
+      .map(|micros| Duration::from_micros(micros as u64))
   }
 }

@@ -1,23 +1,27 @@
-use crate::command::{CoordinatorCommand, ShutdownMode, WorkerOutcome};
+use crate::command::{CoordinatorCommand, JobUpdateData, ShutdownMode, WorkerOutcome};
 use crate::error::QueryError;
 use crate::job::{
-  BoxedExecFn, InstanceId, JobDefinition, JobDetails, JobSummary, RecurringJobId,
-  RecurringJobRequest, WorkerId,
+  BoxedExecFn, InstanceId, JobDefinition, JobDetails, JobSummary, MaxRetries, RecurringJobId,
+  RecurringJobRequest,
 };
 use crate::metrics::SchedulerMetrics;
 use crate::scheduler::PriorityQueueType;
-use async_channel;
-use chrono::{DateTime, Utc};
-use priority_queue::priority_queue::PriorityQueue; // Import specific type
+
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
+
+use async_channel;
+use chrono::{DateTime, Utc};
+use priority_queue::priority_queue::PriorityQueue;
 use tokio::sync::{mpsc, watch, Mutex, RwLock};
 use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
+
+type JobDispatchTuple = (InstanceId, RecurringJobId, DateTime<Utc>);
 
 /// Internal state shared and managed by the Coordinator task.
 #[derive(Debug)] // Avoid Clone if not needed
@@ -29,7 +33,7 @@ pub(crate) struct CoordinatorState {
   shutdown_rx: watch::Receiver<Option<ShutdownMode>>,
   worker_outcome_rx: mpsc::Receiver<WorkerOutcome>,
   // Sender
-  job_dispatch_tx: async_channel::Sender<(InstanceId, RecurringJobId)>,
+  job_dispatch_tx: async_channel::Sender<JobDispatchTuple>,
   // Shared Data Structures (protected by locks)
   job_definitions: Arc<RwLock<HashMap<RecurringJobId, JobDefinition>>>,
   cancellations: Arc<RwLock<HashSet<RecurringJobId>>>,
@@ -47,7 +51,7 @@ impl CoordinatorState {
     staging_rx: mpsc::Receiver<(RecurringJobId, RecurringJobRequest, Arc<BoxedExecFn>)>,
     cmd_rx: mpsc::Receiver<CoordinatorCommand>,
     shutdown_rx: watch::Receiver<Option<ShutdownMode>>,
-    job_dispatch_tx: async_channel::Sender<(InstanceId, RecurringJobId)>,
+    job_dispatch_tx: async_channel::Sender<JobDispatchTuple>,
     worker_outcome_rx: mpsc::Receiver<WorkerOutcome>,
     job_definitions: Arc<RwLock<HashMap<RecurringJobId, JobDefinition>>>,
     cancellations: Arc<RwLock<HashSet<RecurringJobId>>>,
@@ -347,34 +351,57 @@ impl Coordinator {
       request.next_run = request.calculate_next_run();
     }
 
-    if let Some(next_run_dt) = request.next_run {
-      let instance_id = Uuid::new_v4();
-      {
-        // Scope for write locks
-        let mut definitions = self.state.job_definitions.write().await;
-        let mut i_to_l_map = self.state.instance_to_lineage.write().await;
+    // Insert definition and schedule first instance (if applicable)
 
-        let definition = JobDefinition {
-          request, // Consumed here
-          exec_fn,
-          lineage_id,
-          current_instance_id: Some(instance_id),
-        };
-        definitions.insert(lineage_id, definition);
-        i_to_l_map.insert(instance_id, lineage_id);
-      } // Locks released
+    let mut instance_to_push: Option<(InstanceId, DateTime<Utc>)> = None;
+    let mut should_wake_timer = false;
 
-      // Push to the appropriate PQ
+    // Scope for write locks needed for insertion/initial scheduling
+    {
+      let mut definitions = self.state.job_definitions.write().await;
+      let mut i_to_l_map = self.state.instance_to_lineage.write().await;
+
+      // Determine instance ID only if scheduling needed
+      let first_instance_id = request.next_run.map(|_| Uuid::new_v4());
+
+      let definition = JobDefinition {
+        request, // Consumed here
+        exec_fn,
+        lineage_id,
+        current_instance_id: first_instance_id,
+      };
+      definitions.insert(lineage_id, definition); // Insert definition
+
+      // Prepare data for pushing to PQ if needed
+      if let Some(instance_id) = first_instance_id {
+        // Re-access the inserted definition to get the next run time
+        if let Some(inserted_def) = definitions.get(&lineage_id) {
+          if let Some(next_run_dt) = inserted_def.request.next_run {
+            i_to_l_map.insert(instance_id, lineage_id); // Add mapping
+            instance_to_push = Some((instance_id, next_run_dt)); // Store data needed for PQ push
+            should_wake_timer = true; // Mark that we might need to wake timer
+            trace!(%instance_id, %lineage_id, next_run = %next_run_dt, "Prepared first instance for push.");
+          } else {
+            warn!(%lineage_id, "Inconsistency: next_run became None after insert.");
+          }
+        } else {
+          warn!(%lineage_id, "Inconsistency: definition disappeared immediately after insert.");
+        }
+      } else {
+        trace!(%lineage_id, "Inserted job definition with no initial schedule.");
+      }
+      // -- Locks (`definitions`, `i_to_l_map`) are released here --
+    }
+
+    // Push to PQ *outside* the lock scope (requires await)
+    if let Some((instance_id, next_run_dt)) = instance_to_push {
       self.pq.push(instance_id, next_run_dt).await;
-      trace!(%instance_id, %lineage_id, next_run = %next_run_dt, "Pushed instance, added instance->lineage mapping.");
-      self.try_wake_timer(); // Wake select loop if this job is now the earliest
-    } else {
-      warn!(
-          job_name = %request.name,
-          %lineage_id,
-          "Job has no valid next run time (schedule likely empty), discarding."
-      );
-      // Increment a metric for discarded jobs?
+      trace!(%instance_id, %lineage_id, "Pushed first instance to PQ.");
+    }
+
+    // Wake timer *after* all locks are released and awaits are done
+    if should_wake_timer {
+      self.try_wake_timer();
     }
   }
 
@@ -396,6 +423,7 @@ impl Coordinator {
             schedule: def.request.schedule.clone(),
             max_retries: def.request.max_retries,
             retry_count: def.request.retry_count,
+            retry_delay: def.request.retry_delay,
             next_run_instance: def.current_instance_id,
             next_run_time, // Use the time stored in the definition state
             is_cancelled,
@@ -503,6 +531,18 @@ impl Coordinator {
           self.try_wake_timer();
         }
       }
+      CoordinatorCommand::UpdateJob {
+        job_id,
+        update_data,
+        responder,
+      } => {
+        let result = self.handle_update_job(job_id, update_data).await;
+        let _ = responder.send(result);
+      }
+      CoordinatorCommand::TriggerJobNow { job_id, responder } => {
+        let result = self.handle_trigger_job_now(job_id).await;
+        let _ = responder.send(result);
+      }
     } // end match cmd
   }
 
@@ -511,39 +551,52 @@ impl Coordinator {
     match outcome {
       WorkerOutcome::Reschedule {
         lineage_id,
-        completed_instance_id, // Maps already cleaned before dispatch
+        completed_instance_id,
         next_run_time,
         updated_retry_count,
       } => {
+        // 1) Capture the “official” scheduled instance up front
+        let scheduled_instance = {
+          let defs = self.state.job_definitions.read().await;
+          defs.get(&lineage_id).and_then(|d| d.current_instance_id)
+        };
+
+        // 2) Always clean up the completed instance
         self
           .cleanup_instance_maps(completed_instance_id, lineage_id)
           .await;
 
-        // Need write locks to update definition and instance map
-        let mut definitions = self.state.job_definitions.write().await;
-        let mut i_to_l_map = self.state.instance_to_lineage.write().await;
+        // 3) Now branch:
+        if Some(completed_instance_id) == scheduled_instance {
+          // — the real scheduled run finished; proceed to schedule the next one as before —
+          let mut definitions = self.state.job_definitions.write().await;
+          let mut i_to_l_map = self.state.instance_to_lineage.write().await;
+          if let Some(def) = definitions.get_mut(&lineage_id) {
+            def.request.retry_count = updated_retry_count;
+            def.request.next_run = Some(next_run_time);
 
-        if let Some(def) = definitions.get_mut(&lineage_id) {
-          // Update state in the definition store
-          def.request.retry_count = updated_retry_count;
-          def.request.next_run = Some(next_run_time); // Store calculated next run
+            let new_instance_id = Uuid::new_v4();
+            def.current_instance_id = Some(new_instance_id);
+            i_to_l_map.insert(new_instance_id, lineage_id);
 
-          // Create and store info for the *new* instance
-          let new_instance_id = Uuid::new_v4();
-          def.current_instance_id = Some(new_instance_id);
-          i_to_l_map.insert(new_instance_id, lineage_id);
+            drop(i_to_l_map);
+            drop(definitions);
 
-          // Drop locks before potentially blocking await on push
-          drop(i_to_l_map);
-          drop(definitions);
-
-          // Add the new instance to the priority queue
-          self.pq.push(new_instance_id, next_run_time).await;
-          info!(%lineage_id, %new_instance_id, next_run = %next_run_time, "Rescheduled job instance.");
-          self.try_wake_timer(); // New job might be the soonest
+            self.pq.push(new_instance_id, next_run_time).await;
+            info!("Rescheduled job instance.");
+            self.try_wake_timer();
+          }
         } else {
-          // This could happen if cancelled between completion and outcome processing
-          warn!(%lineage_id, "Received reschedule outcome for non-existent or removed job definition.");
+          // — it was the manual trigger that just ran —
+          // Restore the stored scheduled instance so future dispatches see it:
+          if let Some(orig_id) = scheduled_instance {
+            let mut definitions = self.state.job_definitions.write().await;
+            if let Some(def) = definitions.get_mut(&lineage_id) {
+              def.current_instance_id = Some(orig_id);
+            }
+            // No need to re-insert into instance->lineage; that mapping never went away.
+          }
+          // Do not schedule anything else here.
         }
       }
       WorkerOutcome::Complete {
@@ -590,6 +643,180 @@ impl Coordinator {
     }
   }
 
+  /// Handles the logic for the UpdateJob command.
+  async fn handle_update_job(
+    &mut self,
+    job_id: RecurringJobId,
+    update_data: JobUpdateData,
+  ) -> Result<(), QueryError> {
+    // 1. Ensure we're using a handle‐based PQ
+    if self.state.pq_type != PriorityQueueType::HandleBased {
+      warn!(%job_id, "Attempted to update job using BinaryHeap PQ.");
+      return Err(QueryError::UpdateRequiresHandleBasedPQ);
+    }
+
+    // 2. Determine if schedule actually changed
+    let mut needs_reschedule = false;
+    let mut old_instance_to_remove: Option<InstanceId> = None;
+    {
+      let mut defs = self.state.job_definitions.write().await;
+      let def = defs
+        .get_mut(&job_id)
+        .ok_or(QueryError::JobNotFound(job_id))?;
+
+      if let Some(new_schedule) = update_data.schedule {
+        if def.request.schedule != new_schedule {
+          def.request.schedule = new_schedule.clone();
+          needs_reschedule = true;
+          info!(%job_id, "Updated job schedule.");
+        }
+      }
+      if let Some(new_max) = update_data.max_retries {
+        if def.request.max_retries != new_max {
+          def.request.max_retries = new_max;
+          info!(%job_id, "Updated job max_retries.");
+        }
+      }
+      if needs_reschedule {
+        // stash the old instance so we can remove it
+        old_instance_to_remove = def.current_instance_id.take();
+      }
+    }
+
+    // 3. If nothing changed, bump metrics and return
+    if !needs_reschedule {
+      return Ok(());
+    }
+
+    info!(%job_id, "Rescheduling job due to update.");
+
+    // CHANGE: Check cancellation before scheduling anything
+    let is_cancelled = {
+      let cancels = self.state.cancellations.read().await;
+      cancels.contains(&job_id)
+    };
+    if is_cancelled {
+      // Job is cancelled: do NOT enqueue a new instance
+      info!(%job_id, "Job is cancelled—skipping reschedule.");
+      return Ok(());
+    }
+
+    // 4. Remove the old instance from PQ & map
+    if let Some(old_id) = old_instance_to_remove {
+      {
+        let mut map = self.state.instance_to_lineage.write().await;
+        map.remove(&old_id);
+      }
+      if self.pq.remove(&old_id).await {
+        trace!(%job_id, %old_id, "Removed old instance during update.");
+      }
+    }
+
+    // 5. Compute & enqueue the new instance
+    let new_instance_id = Uuid::new_v4();
+    let next_run_opt = {
+      let mut defs = self.state.job_definitions.write().await;
+      let def = defs.get_mut(&job_id).unwrap(); // safe: we know it exists
+      def.request.next_run = def.request.schedule.calculate_next_run(Utc::now());
+      def.request.retry_count = 0;
+      if let Some(dt) = def.request.next_run {
+        def.current_instance_id = Some(new_instance_id);
+        Some(dt)
+      } else {
+        warn!(%job_id, "Updated schedule has no future runs.");
+        None
+      }
+    };
+
+    if let Some(next_run) = next_run_opt {
+      {
+        let mut map = self.state.instance_to_lineage.write().await;
+        map.insert(new_instance_id, job_id);
+      }
+      self.pq.push(new_instance_id, next_run).await;
+      trace!(%job_id, %new_instance_id, next_run=%next_run, "Scheduled updated job instance.");
+      self.try_wake_timer();
+    }
+
+    Ok(())
+  }
+
+  /// Handles the logic for the TriggerJobNow command.
+  async fn handle_trigger_job_now(&mut self, job_id: RecurringJobId) -> Result<(), QueryError> {
+    // ——————————————————————————————————————————————
+    // 1) Read‐lock and existence/cancellation checks (unchanged)
+    let definitions = self.state.job_definitions.read().await;
+    let cancellations = self.state.cancellations.read().await;
+
+    if !definitions.contains_key(&job_id) {
+      warn!(%job_id, "Attempted to trigger non-existent job.");
+      drop(cancellations);
+      drop(definitions);
+      return Err(QueryError::JobNotFound(job_id));
+    }
+
+    if cancellations.contains(&job_id) {
+      warn!(%job_id, "Attempted to trigger cancelled job.");
+      drop(cancellations);
+      drop(definitions);
+      return Err(QueryError::TriggerFailedJobCancelled(job_id));
+    }
+    // ——————————————————————————————————————————————
+
+    // ——————————————————————————————————————————————
+    // 2) **ONLY** reject if this is a one-off (`Schedule::Once`) AND it already has an instance
+    let def = definitions.get(&job_id).unwrap();
+    if let crate::job::Schedule::Once(_) = &def.request.schedule {
+      if def.current_instance_id.is_some() {
+        warn!(%job_id, "Attempted to trigger a one-off job already scheduled.");
+        drop(cancellations);
+        drop(definitions);
+        return Err(QueryError::TriggerFailedJobScheduled(job_id));
+      }
+    }
+    // For recurring (or `Never`) schedules, we fall through and allow the trigger.
+    // ——————————————————————————————————————————————
+
+    drop(cancellations);
+    drop(definitions);
+
+    // 3) Create the manual‐trigger instance
+    let instance_id = Uuid::new_v4();
+    let trigger_time = Utc::now();
+
+    {
+      // Write‐lock: register in instance→lineage map
+      let mut i_to_l_map = self.state.instance_to_lineage.write().await;
+      i_to_l_map.insert(instance_id, job_id);
+    }
+
+    {
+      // Write‐lock: update JobDefinition **only for one-offs**
+      let mut defs = self.state.job_definitions.write().await;
+      if let Some(def_mut) = defs.get_mut(&job_id) {
+        // CHANGE: override for one-offs AND Never
+        match def_mut.request.schedule {
+          crate::job::Schedule::Once(_) | crate::job::Schedule::Never => {
+            def_mut.current_instance_id = Some(instance_id);
+            def_mut.request.retry_count = 0;
+          }
+          _ => {
+            // recurring: leave current_instance_id pointing at the real schedule
+          }
+        }
+      }
+    }
+
+    // 4) Enqueue the trigger and immediately dispatch it
+    self.pq.push(instance_id, trigger_time).await;
+    info!(%job_id, %instance_id, trigger_time=%trigger_time,
+          "Manually triggered job instance scheduled.");
+    self.try_wake_timer();
+    self.try_dispatch_jobs().await;
+
+    Ok(())
+  }
+
   /// Checks the PQ and dispatches any ready jobs via the async_channel.
   async fn try_dispatch_jobs(&mut self) {
     // Don't dispatch if gracefully shutting down
@@ -621,11 +848,11 @@ impl Coordinator {
           // Job is ready or overdue. Now try to pop and process.
 
           // Pop BEFORE checking cancellation/dispatching
-          let (_ready_dt, ready_instance_id) = match self.pq.pop().await {
+          let (ready_dt, ready_instance_id) = match self.pq.pop().await {
             Some(item) => item,
             None => {
               warn!("Peeked job disappeared before pop! PQ inconsistency?");
-              continue; // Try peeking again
+              continue;
             }
           };
 
@@ -686,12 +913,13 @@ impl Coordinator {
             trace!(
                 %lineage_id,
                 %ready_instance_id,
+                scheduled_at = %ready_dt,
                 "Attempting dispatch via channel."
             );
             if let Err(e) = self
               .state
               .job_dispatch_tx
-              .send((ready_instance_id, lineage_id)) // Send IDs
+              .send((ready_instance_id, lineage_id, ready_dt)) // Send IDs
               .await
             {
               error!(

@@ -3,10 +3,10 @@
 //! Demonstrates scheduling a job to run only once using TurnKeeper.
 
 use chrono::{Duration as ChronoDuration, Utc};
-use tracing::{error, info};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
+use tracing::{error, info};
 use turnkeeper::{job::RecurringJobRequest, scheduler::PriorityQueueType, TurnKeeper};
 
 #[tokio::main]
@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   let job_req = RecurringJobRequest::from_once(
     "One Time Job",
     run_time,
-    0,      // No retries needed for this example
+    0, // No retries needed for this example
   );
 
   info!("Job scheduled for one-time run at: {}", run_time);

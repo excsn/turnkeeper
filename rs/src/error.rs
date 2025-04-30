@@ -1,8 +1,10 @@
-use crate::job::{BoxedExecFn, RecurringJobId, RecurringJobRequest}; use core::fmt;
-// Import necessary types
+use crate::job::{BoxedExecFn, RecurringJobId, RecurringJobRequest};
+
+use core::fmt;
 use std::sync::Arc;
+
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot}; // Import channel error types if needed directly
+use tokio::sync::mpsc;
 
 /// Errors that can occur during the scheduler building phase using `SchedulerBuilder`.
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
@@ -71,7 +73,16 @@ pub enum QueryError {
   ResponseFailed,
   #[error("Job with lineage ID {0} not found.")]
   JobNotFound(RecurringJobId),
-  // Add other specific query errors if needed, e.g., InvalidQueryParameter
+  #[error("Job update requires the HandleBased priority queue, but BinaryHeap is configured.")]
+  UpdateRequiresHandleBasedPQ,
+  #[error("Cannot update job {0}: Update failed internally.")] // Generic update failure
+  UpdateFailed(RecurringJobId),
+  #[error("Cannot trigger job {0}: Job is already running or scheduled.")]
+  TriggerFailedJobScheduled(RecurringJobId),
+  #[error("Cannot trigger job {0}: Trigger failed internally.")] // Generic trigger failure
+  TriggerFailed(RecurringJobId),
+  #[error("Cannot trigger job {0}: Job is marked as cancelled.")]
+  TriggerFailedJobCancelled(RecurringJobId),
 }
 
 // --- Shutdown Errors ---

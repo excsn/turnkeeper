@@ -1,3 +1,6 @@
+#[cfg(feature = "job_context")]
+pub mod context;
+
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -6,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveTime, Utc, Weekday};
+#[cfg(feature = "cron_schedule")]
 use cron::Schedule as CronSchedule;
 use tracing::warn;
 use uuid::Uuid;
@@ -19,6 +23,8 @@ pub type RecurringJobId = Uuid;
 /// Type alias for the unique identifier of a specific scheduled instance of a job.
 /// Uses UUID v4.
 pub type InstanceId = Uuid;
+
+pub type MaxRetries = u32;
 
 /// Type alias for the simple numeric ID assigned to worker tasks for logging.
 pub(crate) type WorkerId = usize;
@@ -43,6 +49,7 @@ pub enum Schedule {
   WeekdayTimes(Vec<(Weekday, NaiveTime)>),
   /// Run based on a standard CRON expression (UTC interpretation).
   /// Requires the `cron` crate.
+  #[cfg(feature = "cron_schedule")]
   Cron(String),
   /// Run repeatedly at a fixed interval *after* the last scheduled/run time.
   FixedInterval(StdDuration),
@@ -61,6 +68,7 @@ impl Schedule {
       Schedule::WeekdayTimes(times) => {
         calculate_next_weekday_time(times, reference_time) // Use helper
       }
+      #[cfg(feature = "cron_schedule")]
       Schedule::Cron(expression) => match CronSchedule::from_str(expression) {
         Ok(cron_schedule) => cron_schedule.after(&reference_time).next(),
         Err(e) => {
@@ -180,6 +188,7 @@ fn calculate_next_weekday_time(
 /// Use the [`RecurringJobRequest::new`] constructor and [`RecurringJobRequest::with_initial_run_time`]
 /// builder method to create instances.
 #[derive(Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RecurringJobRequest {
   /// A descriptive name for the job (used in logging/tracing).
   pub name: String,
@@ -188,8 +197,9 @@ pub struct RecurringJobRequest {
   /// The maximum number of times a failed execution (returned `false` or panicked)
   /// should be retried before being marked as permanently failed for that cycle.
   /// A value of 0 means no retries will be attempted.
-  pub max_retries: u32,
-
+  pub max_retries: MaxRetries,
+  /// Optional fixed delay between retry attempts. If `None`, exponential backoff is used.
+  pub retry_delay: Option<StdDuration>,
   // --- Internal State (Managed by Scheduler) ---
   /// The current retry attempt number for the *next* scheduled run.
   /// This is managed internally by the scheduler and should not typically be set directly.
@@ -210,7 +220,7 @@ impl fmt::Debug for RecurringJobRequest {
       .field("name", &self.name)
       .field("schedule", &self.schedule)
       .field("max_retries", &self.max_retries)
-      // Internal fields are included for completeness in Debug output
+      .field("retry_delay", &self.retry_delay)
       .field("retry_count", &self.retry_count)
       .field("next_run", &self.next_run)
       .finish()
@@ -235,8 +245,25 @@ impl RecurringJobRequest {
       name: name.to_string(),
       schedule,
       max_retries,
+      retry_delay: None,
       retry_count: 0, // Start with zero retries counted
       next_run: None, // Will be calculated by Coordinator/Worker unless overridden
+    }
+  }
+
+  pub fn with_fixed_retry_delay(
+    name: &str,
+    schedule: Schedule,
+    max_retries: MaxRetries,
+    retry_delay: StdDuration,
+  ) -> Self {
+    Self {
+      name: name.to_string(),
+      schedule,
+      max_retries,
+      retry_delay: Some(retry_delay),
+      retry_count: 0,
+      next_run: None,
     }
   }
 
@@ -245,64 +272,38 @@ impl RecurringJobRequest {
     weekday_times: Vec<(Weekday, NaiveTime)>,
     max_retries: u32,
   ) -> Self {
-    Self {
-      name: name.to_string(),
-      schedule: Schedule::WeekdayTimes(weekday_times),
-      max_retries,
-      retry_count: 0, // Start with zero retries counted
-      next_run: None, // Will be calculated by Coordinator/Worker unless overridden
-    }
+    Self::new(name, Schedule::WeekdayTimes(weekday_times), max_retries)
   }
 
   /// Creates a new job request scheduled via a CRON expression (interpreted in UTC).
   /// Requires the `cron` crate feature/dependency.
+  #[cfg(feature = "cron_schedule")]
   pub fn from_cron(name: &str, cron_expression: &str, max_retries: u32) -> Self {
-    Self {
-      name: name.to_string(),
-      schedule: Schedule::Cron(cron_expression.to_string()),
+    Self::new(
+      name,
+      Schedule::Cron(cron_expression.to_string()),
       max_retries,
-      retry_count: 0,
-      next_run: None,
-    }
+    )
   }
 
   /// Creates a new job request scheduled to run at fixed intervals.
   /// The first run typically needs to be set via `.with_initial_run_time()`
   /// or it will be scheduled based on `Utc::now() + interval`.
   pub fn from_interval(name: &str, interval: StdDuration, max_retries: u32) -> Self {
-    Self {
-      name: name.to_string(),
-      schedule: Schedule::FixedInterval(interval),
-      max_retries,
-      retry_count: 0,
-      next_run: None,
-    }
+    Self::new(name, Schedule::FixedInterval(interval), max_retries)
   }
 
   /// Creates a new job request scheduled to run exactly once at the specified UTC time.
   pub fn from_once(name: &str, run_at: DateTime<Utc>, max_retries: u32) -> Self {
-    // For a 'Once' job, the max_retries applies if the single execution fails.
-    Self {
-      name: name.to_string(),
-      schedule: Schedule::Once(run_at),
-      max_retries,
-      retry_count: 0,
-      // Set the initial/only run time directly
-      next_run: Some(run_at),
-    }
+    let mut req = Self::new(name, Schedule::Once(run_at), max_retries);
+    req.next_run = Some(run_at); // Set initial time for Once schedule
+    req
   }
 
   /// Creates a job request with no recurring schedule.
   /// It will only run if `.with_initial_run_time()` is called.
   pub fn never(name: &str, max_retries: u32) -> Self {
-    // max_retries applies if the initial manually triggered run fails.
-    Self {
-      name: name.to_string(),
-      schedule: Schedule::Never,
-      max_retries,
-      retry_count: 0,
-      next_run: None,
-    }
+    Self::new(name, Schedule::Never, max_retries)
   }
 
   /// Sets a specific initial run time for the job's first execution.
@@ -331,36 +332,50 @@ impl RecurringJobRequest {
   /// Calculates the next run time after a failure, using exponential backoff.
   /// Uses the *next* retry attempt number (`current_retry_count + 1`) for calculation.
   pub(crate) fn calculate_retry_time(&self) -> DateTime<Utc> {
-    // Use the count of the retry *attempt* we are scheduling (which is current + 1)
-    let attempt_number = self.retry_count.saturating_add(1); // Use saturating_add for safety
+    let now = Utc::now();
 
-    // Exponential backoff: base_delay * factor^(attempt - 1)
-    // Example: 60s * 3^0, 60s * 3^1, 60s * 3^2...
-    // Cap exponent to prevent excessively long delays and potential overflow.
-    let base_delay_secs: u64 = 60; // 1 minute base
-    let factor: u64 = 3;
-    let max_exponent: u32 = 5; // Example cap: 3^5 = 243. Delay = 60 * 243 = ~4 hours
-
-    // Exponent starts at 0 for the first retry (attempt_number=1)
-    let exponent = std::cmp::min(attempt_number.saturating_sub(1), max_exponent);
-
-    // Use checked_pow and checked_mul for overflow safety
-    let factor_pow = factor.checked_pow(exponent).unwrap_or(u64::MAX);
-    let backoff_seconds = base_delay_secs.checked_mul(factor_pow).unwrap_or(u64::MAX);
-
-    // Ensure backoff doesn't exceed a reasonable maximum duration if needed
-    // const MAX_BACKOFF_SECS: u64 = 60 * 60 * 24; // e.g., 1 day max backoff
-    // let final_backoff_seconds = std::cmp::min(backoff_seconds, MAX_BACKOFF_SECS);
-
-    // Use i64 for ChronoDuration::seconds
-    if let Ok(backoff_i64) = backoff_seconds.try_into() {
-      Utc::now()
-        .checked_add_signed(ChronoDuration::seconds(backoff_i64))
-        .unwrap_or_else(|| Utc::now() + ChronoDuration::seconds(i64::MAX / 2)) // Fallback on overflow
+    // <<< MODIFIED START >>>
+    if let Some(fixed_delay) = self.retry_delay {
+      // Use fixed delay
+      match ChronoDuration::from_std(fixed_delay) {
+        Ok(chrono_delay) => {
+          now.checked_add_signed(chrono_delay).unwrap_or_else(|| {
+            warn!(?fixed_delay, "Fixed retry delay addition overflowed.");
+            now + ChronoDuration::seconds(i64::MAX / 2) // Fallback
+          })
+        }
+        Err(e) => {
+          warn!(?fixed_delay, error=%e, "Failed to convert fixed retry delay.");
+          now + ChronoDuration::seconds(60) // Fallback to 60s
+        }
+      }
     } else {
-      // Backoff calculated exceeds i64::MAX seconds, use a large duration
-      warn!("Calculated backoff duration exceeds i64::MAX seconds.");
-      Utc::now() + ChronoDuration::seconds(i64::MAX / 2) // Arbitrary large fallback
+      // Use original exponential backoff logic
+      let attempt_number = self.retry_count.saturating_add(1);
+      let base_delay_secs: u64 = 60; // 1 minute base
+      let factor: u64 = 3;
+      let max_exponent: u32 = 5;
+      let exponent = std::cmp::min(attempt_number.saturating_sub(1), max_exponent);
+      let factor_pow = factor.checked_pow(exponent).unwrap_or(u64::MAX);
+      let backoff_seconds = base_delay_secs.checked_mul(factor_pow).unwrap_or(u64::MAX);
+
+      if let Ok(backoff_i64) = backoff_seconds.try_into() {
+        now
+          .checked_add_signed(ChronoDuration::seconds(backoff_i64))
+          .unwrap_or_else(|| {
+            warn!(
+              attempt = attempt_number,
+              "Exponential backoff duration overflowed."
+            );
+            now + ChronoDuration::seconds(i64::MAX / 2) // Fallback
+          })
+      } else {
+        warn!(
+          attempt = attempt_number,
+          "Exponential backoff duration exceeds i64::MAX seconds."
+        );
+        now + ChronoDuration::seconds(i64::MAX / 2) // Fallback
+      }
     }
   }
 }
@@ -424,9 +439,10 @@ pub struct JobDetails {
   /// The configured schedule definition.
   pub schedule: Schedule,
   /// The configured maximum number of retries per failure cycle.
-  pub max_retries: u32,
+  pub max_retries: MaxRetries,
   /// The current retry count stored (relevant for the next potential run if it's a retry).
   pub retry_count: u32,
+  pub retry_delay: Option<StdDuration>,
   /// The ID of the specific instance currently in the scheduler's queue, if any.
   pub next_run_instance: Option<InstanceId>,
   /// The exact UTC time the `next_run_instance` is scheduled for (if known and scheduled).

@@ -4,65 +4,66 @@
 [![Docs.rs](https://docs.rs/turnkeeper/badge.svg)](https://docs.rs/turnkeeper)
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL--2.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
 
-TurnKeeper is a flexible, asynchronous recurring job scheduler for Rust built on Tokio. It allows scheduling tasks based on various time specifications, handles retries with exponential backoff, supports job cancellation, and provides observability through metrics and state querying.
+TurnKeeper is a flexible, asynchronous recurring job scheduler for Rust built on the Tokio runtime. It allows scheduling tasks based on various time specifications, handles retries with exponential backoff or fixed delays, supports job cancellation and updates, and provides observability through metrics and state querying.
 
 It uses a central coordinator task and a configurable pool of worker tasks, communicating via efficient asynchronous channels.
 
 ## Features
 
 *   **Flexible Scheduling:** Schedule jobs using:
-    *   Multiple `(Weekday, NaiveTime)` pairs (UTC) via `from_week_day`.
-    *   Standard CRON expressions (UTC interpretation) via `from_cron`. Requires the `cron` crate.
+    *   Multiple `(Weekday, NaiveTime)` pairs (interpreted as UTC) via `from_week_day`.
+    *   Standard CRON expressions (interpreted as UTC) via `from_cron` (requires the `cron_schedule` feature).
     *   Fixed intervals (e.g., every 5 minutes) via `from_interval`.
     *   One-time execution at a specific `DateTime<Utc>` via `from_once`.
     *   No automatic scheduling via `never` (requires explicit trigger or initial run time).
-*   **Configurable Retries:** Set maximum retry attempts for failed jobs with exponential backoff.
+*   **Configurable Retries:** Set maximum retry attempts for failed jobs with exponential backoff (default) or fixed delays via `with_fixed_retry_delay`.
 *   **Concurrent Execution:** Run multiple jobs concurrently using a configurable worker pool (`max_workers`).
 *   **Flexible Scheduling Backend:** Choose between:
-    *   `BinaryHeap` (Standard Library): Minimal dependencies, cancellation checks occur when job is next to run.
-    *   `HandleBased` (`priority-queue` crate): Supports proactive cancellation removal (O(log n)), enables efficient job updates (adds dependency).
-*   **Asynchronous API:** Designed for integration into `tokio`-based applications.
+    *   `BinaryHeap` (Standard Library): Minimal dependencies, cancellation checks occur lazily when a job is next to run. No efficient job updates supported.
+    *   `HandleBased` (`priority-queue` crate): Supports proactive cancellation removal (O log n). Required for job updates (`update_job`). Adds dependency (requires `priority_queue_handle_based` feature, enabled by default).
+*   **Asynchronous API:** Designed for integration into `tokio`-based applications. Provides `async`, blocking (`add_job`), and non-blocking (`try_add_job`) submission methods.
 *   **Non-Blocking Submission:** `try_add_job` provides backpressure signaling if the internal buffer is full, returning `Err(SubmitError::StagingFull)`.
-*   **Job Cancellation:** Request cancellation of job lineages via `cancel_job`. Operation is idempotent.
+*   **Job Management:**
+    *   Request cancellation of job lineages (`cancel_job`). Operation is idempotent.
+    *   Update existing job schedules or retry configurations (`update_job`, requires `HandleBased` PQ).
+    *   Manually trigger a job to run immediately (`trigger_job_now`).
 *   **Observability:**
-    *   Query job details (`get_job_details`) and list summaries (`list_all_jobs`). See [`JobDetails`](https://docs.rs/turnkeeper/latest/turnkeeper/struct.JobDetails.html) which includes the `Schedule` type. <!-- TODO: Update docs link -->
-    *   Retrieve internal metrics snapshots (`get_metrics_snapshot`). See [`MetricsSnapshot`](https://docs.rs/turnkeeper/latest/turnkeeper/struct.MetricsSnapshot.html) for available counters/gauges. <!-- TODO: Update docs link -->
+    *   Query job details (`get_job_details`) and list summaries (`list_all_jobs`). See [`JobDetails`](https://docs.rs/turnkeeper/1.1.0/turnkeeper/struct.JobDetails.html) which includes the [`Schedule`](https://docs.rs/turnkeeper/1.1.0/turnkeeper/job/enum.Schedule.html) type.
+    *   Retrieve internal metrics snapshots (`get_metrics_snapshot`). See [`MetricsSnapshot`](https://docs.rs/turnkeeper/1.1.0/turnkeeper/struct.MetricsSnapshot.html) for available counters/gauges.
     *   Integrates with the `tracing` ecosystem for detailed logging.
+*   **Helper Macro:** `job_fn!` macro simplifies creating job execution functions.
+*   **Job Context:** (Optional `job_context` feature) Access job lineage ID and instance ID within the execution function via task-locals.
 *   **Graceful & Forced Shutdown:** Control scheduler termination with optional timeouts.
 
 ## Installation
 
-Add TurnKeeper and its core dependencies to your `Cargo.toml`:
+Add TurnKeeper and its core dependencies to your `Cargo.toml`. Select features as needed.
 
 ```toml
 [dependencies]
-turnkeeper = "0.1.0" # TODO: Replace with the actual desired version
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] } # Tokio is required
-chrono = { version = "0.4", features = ["serde"] } # For time/date handling & Serde support in job types
-uuid = { version = "1", features = ["v4", "serde"] } # For job IDs & Serde support
-
-# Required for Cron scheduling and potentially other features
-cron = "0.12" # Or latest compatible version
+turnkeeper = { version = "1.1.0", features = ["full"] } # Use "full" or select features individually
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] } # Or features needed by your app
+chrono = { version = "0.4", features = ["serde"] } # If using serde feature
+uuid = { version = "1", features = ["v4", "serde"] } # If using serde feature
 
 # Optional, but recommended for logging/debugging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Required if using PriorityQueueType::HandleBased (default)
-priority-queue = "1.3" # Or latest compatible version
-
-# Optional for serde support in job detail/summary structs
-serde = { version = "1.0", features = ["derive"], optional = true }
-
-[features]
-default = []
-# Enable this feature if you need JobDetails/JobSummary serialization
-serde = ["dep:serde", "chrono/serde", "uuid/serde"]
+# Optional dependencies controlled by features:
+# cron = { version = "0.12", optional = true } # Needed by "cron_schedule" feature
+# priority-queue = { version = "2", optional = true } # Needed by "priority_queue_handle_based" feature (default)
+# serde = { version = "1.0", features = ["derive"], optional = true } # Needed by "serde" feature
 ```
 
-*Ensure you have the necessary Tokio features enabled for your application.*
-*Add the `cron` crate.*
-*Enable the `serde` feature if you need serialization for query results.*
+TurnKeeper's features:
+
+*   `full`: Enables `default`, `cron_schedule`, and `serde`.
+*   `default`: Enables `job_context` and `priority_queue_handle_based`.
+*   `job_context`: Enables task-local job context access.
+*   `priority_queue_handle_based`: Enables the `HandleBased` priority queue (required for `update_job`).
+*   `cron_schedule`: Enables `RecurringJobRequest::from_cron` (requires `cron` dependency).
+*   `serde`: Enables Serde support for query result types (`JobDetails`, `JobSummary`, `MetricsSnapshot`) and some internal types (requires `serde` dependency).
 
 ## Quick Start Example
 
@@ -70,6 +71,7 @@ serde = ["dep:serde", "chrono/serde", "uuid/serde"]
 use turnkeeper::{
     TurnKeeper,
     job::RecurringJobRequest,
+    job_fn, // Import the helper macro
     scheduler::PriorityQueueType
 };
 use chrono::{Duration as ChronoDuration, NaiveTime, Utc, Weekday};
@@ -87,39 +89,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Building scheduler...");
     let scheduler = TurnKeeper::builder()
         .max_workers(2) // Run up to 2 jobs at once
-        .priority_queue(PriorityQueueType::HandleBased) // Use the more feature-rich queue
+        // PriorityQueueType::HandleBased is the default
         .build()?;
     info!("Scheduler built.");
 
-    // 2. Define job execution logic
+    // 2. Define job execution logic using job_fn! macro
     let counter = Arc::new(AtomicUsize::new(0));
-    let job_fn = {
-        let counter_clone = counter.clone();
-        move || { // Closure must be Fn + Send + Sync + 'static
-            let current_counter = counter_clone.clone(); // Clone Arc for the async block
-            Box::pin(async move { // Return pinned future
-                let count = current_counter.fetch_add(1, Ordering::Relaxed) + 1;
-                info!("Simple job executed! Count: {}", count);
-                tokio::time::sleep(StdDuration::from_millis(50)).await; // Simulate work
-                true // Return bool for success/failure
-            }) as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+    let job_fn = job_fn! { // Macro handles boxing/pinning
+        {
+            // Optional setup block (runs immediately when closure is created)
+            let job_counter = counter.clone(); // Clone Arcs needed by the async block
+        }
+        { // Main async logic block (captures variables from setup block)
+            let count = job_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            info!("Simple job executed! Count: {}", count);
+            tokio::time::sleep(StdDuration::from_millis(50)).await; // Simulate work
+            true // Return bool for success/failure
         }
     };
 
     // 3. Define job requests using different schedules
-    let mut job_req_once = RecurringJobRequest::from_once(
+    let job_req_once = RecurringJobRequest::from_once(
         "Run Once Job",
         Utc::now() + ChronoDuration::seconds(2),
         1 // Allow 1 retry on failure
     );
 
-    let job_req_interval = RecurringJobRequest::from_interval(
+    let mut job_req_interval = RecurringJobRequest::from_interval(
         "Interval Job",
         StdDuration::from_secs(5), // Run every 5 seconds
         0
     );
-    // Interval job's first run will be calculated ~5s from submission unless overridden:
-    // job_req_interval.with_initial_run_time(Utc::now() + ChronoDuration::seconds(1));
+    // Interval job's first run occurs ~5s after coordinator processes it,
+    // unless overridden:
+    job_req_interval.with_initial_run_time(Utc::now() + ChronoDuration::seconds(1));
 
 
     // 4. Submit the jobs (using async variant)
@@ -160,7 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 Use `TurnKeeper::builder()` to configure the scheduler before starting it via `.build()`:
 
 *   `.max_workers(usize)`: **Required.** Sets the maximum number of concurrently running jobs (must be > 0).
-*   `.priority_queue(PriorityQueueType)`: Optional. Choose between `BinaryHeap` and `HandleBased` (default). See [`PriorityQueueType`](https://docs.rs/turnkeeper/latest/turnkeeper/enum.PriorityQueueType.html) docs for functional differences. <!-- TODO: Update docs link -->
+*   `.priority_queue(PriorityQueueType)`: Optional. Choose between `BinaryHeap` and `HandleBased` (default, requires `priority_queue_handle_based` feature). See [`PriorityQueueType`](https://docs.rs/turnkeeper/1.1.0/turnkeeper/scheduler/enum.PriorityQueueType.html) docs for functional differences.
 *   `.staging_buffer_size(usize)`: Optional. Size of the incoming job submission buffer. Default: 128.
 *   `.command_buffer_size(usize)`: Optional. Size of the internal command buffer (queries, etc.). Default: 128.
 *   `.job_dispatch_buffer_size(usize)`: Optional. Size of the coordinator-to-worker dispatch channel. Must be >= 1. Default: 1 (provides backpressure).
@@ -169,15 +172,16 @@ Use `TurnKeeper::builder()` to configure the scheduler before starting it via `.
 
 Create a `RecurringJobRequest` using specific constructors:
 
-*   **`from_week_day(...)`**: Takes `name`, `Vec<(Weekday, NaiveTime)>` (schedule), `max_retries`. Schedule is UTC.
-*   **`from_cron(...)`**: Takes `name`, `&str` (cron expression), `max_retries`. Requires `cron` crate.
-*   **`from_interval(...)`**: Takes `name`, `std::time::Duration` (interval), `max_retries`. Interval starts after the previous scheduled/run time.
+*   **`from_week_day(...)`**: Takes `name`, `Vec<(Weekday, NaiveTime)>` (schedule), `max_retries`. Schedule times are interpreted as UTC.
+*   **`from_cron(...)`**: Takes `name`, `&str` (cron expression), `max_retries`. Requires the `cron_schedule` feature. Expression interpreted as UTC.
+*   **`from_interval(...)`**: Takes `name`, `std::time::Duration` (interval), `max_retries`. Interval starts *after* the previous scheduled/run time.
 *   **`from_once(...)`**: Takes `name`, `DateTime<Utc>` (run time), `max_retries`.
 *   **`never(...)`**: Takes `name`, `max_retries`. Job has no automatic schedule.
+*   **`with_fixed_retry_delay(...)`**: Alternative constructor that takes a `Schedule` and a `StdDuration` for fixed retry delays.
 
-Use `.with_initial_run_time(DateTime<Utc>)` to set a specific first execution time. This overrides the schedule calculation for the *first* run and is required for `Schedule::Never` jobs to run at all.
+Use `.with_initial_run_time(DateTime<Utc>)` to set a specific first execution time. This overrides the schedule calculation for the *first* run and is required for `Schedule::Never` jobs to run without a manual trigger.
 
-The schedule type itself is defined by the [`Schedule` enum](https://docs.rs/turnkeeper/latest/turnkeeper/job/enum.Schedule.html). <!-- TODO: Update docs link -->
+The schedule type itself is defined by the [`Schedule` enum](https://docs.rs/turnkeeper/1.1.0/turnkeeper/job/enum.Schedule.html).
 
 ## Job Function (`BoxedExecFn`)
 
@@ -193,28 +197,30 @@ type BoxedExecFn = Box<
 >;
 ```
 
-*   It must be an `async` function or closure returning a `Pin<Box<dyn Future>>`.
+*   It must be an `async` function or closure returning a `Pin<Box<dyn Future>>`. The `job_fn!` macro simplifies this.
 *   The `Future` must resolve to `bool` (`true` = success, `false` = logical failure).
 *   The function/closure and the `Future` must be `Send + Sync + 'static`. Use `Arc` for shared state captured by closures.
-*   Panics within the function are caught and treated as failures by the scheduler.
+*   Panics within the function are caught and treated as failures by the scheduler, triggering retries if configured.
 
 ## API Highlights
 
-See the [API Reference Documentation](API_REFERENCE.md) (or link to docs.rs) for full details. <!-- TODO: Link API Ref -->
+See the [API Reference Documentation on docs.rs](https://docs.rs/turnkeeper/1.1.0/turnkeeper/) for full details.
 
-*   `add_job_async` / `try_add_job`: Submit jobs using `RecurringJobRequest`, returns `Result<RecurringJobId, SubmitError>`.
+*   `add_job_async` / `try_add_job` / `add_job`: Submit jobs using `RecurringJobRequest`, returns `Result<RecurringJobId, SubmitError>`. IDs (`RecurringJobId`) are generated *before* sending to the coordinator.
 *   `cancel_job`: Request lineage cancellation by `RecurringJobId`.
-*   `get_job_details` / `list_all_jobs`: Query job status by `RecurringJobId` or list all. Returns details including the `Schedule`.
-*   `get_metrics_snapshot`: Get performance counters and gauges.
+*   `update_job`: Update schedule/retries for existing job (`HandleBased` PQ required).
+*   `trigger_job_now`: Manually run a job instance now.
+*   `get_job_details` / `list_all_jobs`: Query job status by `RecurringJobId` or list all. Returns details including the [`Schedule`](https://docs.rs/turnkeeper/1.1.0/turnkeeper/job/enum.Schedule.html).
+*   `get_metrics_snapshot`: Get performance counters and gauges. Includes distinct counts for lineage cancellation vs. discarded instances.
 *   `shutdown_graceful` / `shutdown_force`: Control termination with optional timeout.
 
 ## Cancellation & Updates
 
 *   `cancel_job` marks a job lineage (`RecurringJobId`) for cancellation.
-*   If using `PriorityQueueType::HandleBased`, the scheduler *attempts* to proactively remove the currently scheduled instance from the queue (O log n).
+*   If using `PriorityQueueType::HandleBased` (default), the scheduler *attempts* to proactively remove the currently scheduled instance from the queue (O log n).
 *   If using `PriorityQueueType::BinaryHeap`, the scheduled instance is only discarded when it reaches the front of the queue and is checked before dispatch.
-*   Updating job parameters (schedule, retries, function) after submission is not directly supported in this version. `HandleBased` provides a foundation for potential future implementation.
+*   `update_job` allows changing the `Schedule` and `max_retries` of a non-cancelled job. Requires the `HandleBased` PQ type. If the schedule changes, the next instance is rescheduled accordingly.
 
 ## License
 
-This project is licensed under the **Mozilla Public License Version 2.0** ([LICENSE-MPL-2.0](LICENSE-MPL-2.0) or https://opensource.org/licenses/MPL-2.0).
+This project is licensed under the **Mozilla Public License Version 2.0** ([LICENSE](https://github.com/excsn/turnkeeper/blob/main/rs/LICENSE) or https://opensource.org/licenses/MPL-2.0).

@@ -6,12 +6,12 @@
 //! - Cancelling a job.
 
 use chrono::{Datelike, Duration as ChronoDuration, NaiveTime, Utc, Weekday};
-use tracing::{error, info, warn};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tokio::sync::Mutex;
+use tracing::{error, info, warn};
 use turnkeeper::{job::RecurringJobRequest, scheduler::PriorityQueueType, TurnKeeper};
 use uuid::Uuid;
 

@@ -1,20 +1,23 @@
-use crate::command::{CoordinatorCommand, ShutdownMode};
+use crate::command::{CoordinatorCommand, JobUpdateData, ShutdownMode};
 use crate::coordinator::{Coordinator, CoordinatorState};
 use crate::error::{BuildError, QueryError, ShutdownError, SubmitError};
 use crate::job::{
-  BoxedExecFn, InstanceId, JobDetails, JobSummary, RecurringJobId, RecurringJobRequest,
+  BoxedExecFn, InstanceId, JobDetails, JobSummary, MaxRetries, RecurringJobId, RecurringJobRequest,
 };
 use crate::metrics::{MetricsSnapshot, SchedulerMetrics};
 use crate::worker::Worker;
-use async_channel;
-use chrono::{DateTime, Utc};
-use futures::future::try_join_all;
+use crate::Schedule;
+
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::Arc;
 use std::time::Duration;
+
+use async_channel;
+use chrono::{DateTime, Utc};
+use futures::future::try_join_all;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, watch, Mutex, RwLock};
 use tokio::task::JoinHandle;
@@ -23,6 +26,8 @@ use uuid::Uuid;
 
 const DEFAULT_CHANNEL_BOUND: usize = 128; // For staging and command channels
 const DEFAULT_JOB_DISPATCH_BOUND: usize = 1; // For coordinator -> worker job dispatch
+
+type JobDispatchTuple = (InstanceId, RecurringJobId, DateTime<Utc>);
 
 /// Specifies the underlying priority queue implementation used by the scheduler.
 ///
@@ -172,6 +177,9 @@ impl SchedulerBuilder {
     let (job_dispatch_tx, job_dispatch_rx) =
       async_channel::bounded::<(InstanceId, RecurringJobId)>(self.job_dispatch_buffer_size);
 
+    let (job_dispatch_tx, job_dispatch_rx) =
+      async_channel::bounded::<JobDispatchTuple>(self.job_dispatch_buffer_size);
+
     let (worker_outcome_tx, worker_outcome_rx) =
       mpsc::channel::<crate::command::WorkerOutcome>(self.command_buffer_size);
 
@@ -261,7 +269,7 @@ impl TurnKeeper {
   }
 
   /// This function panics if called within an asynchronous execution context.
-  /// 
+  ///
   /// Attempts to submit a job for scheduling, returning its unique lineage ID on success.
   ///
   /// This method is blocking. If the internal staging buffer is full,
@@ -464,6 +472,81 @@ impl TurnKeeper {
   pub async fn cancel_job(&self, job_id: RecurringJobId) -> Result<(), QueryError> {
     let (responder, response_rx) = oneshot::channel();
     let cmd = CoordinatorCommand::CancelJob { job_id, responder };
+    self
+      .cmd_tx
+      .send(cmd)
+      .await
+      .map_err(|_| QueryError::SchedulerShutdown)?;
+    response_rx.await.map_err(|_| QueryError::ResponseFailed)? // Unpack inner Result
+  }
+
+  /// Updates the configuration of an existing job lineage.
+  ///
+  /// Currently supports updating the `schedule` and `max_retries`.
+  /// Requires the scheduler to be configured with `PriorityQueueType::HandleBased`.
+  /// If the schedule is updated, the currently scheduled instance (if any) is
+  /// removed and a new instance is scheduled based on the new schedule.
+  ///
+  /// # Arguments
+  ///
+  /// * `job_id`: The lineage ID of the job to update.
+  /// * `schedule`: Optional new schedule. `None` leaves the schedule unchanged.
+  /// * `max_retries`: Optional new max retry count. `None` leaves retries unchanged.
+  ///
+  /// # Errors
+  ///
+  /// - [`QueryError::SchedulerShutdown`]: Scheduler is not running.
+  /// - [`QueryError::ResponseFailed`]: Coordinator failed to respond.
+  /// - [`QueryError::JobNotFound`]: No job with the given ID exists.
+  /// - [`QueryError::UpdateRequiresHandleBasedPQ`]: Scheduler is using `BinaryHeap`.
+  /// - [`QueryError::UpdateFailed`]: Internal error during update.
+  pub async fn update_job(
+    &self,
+    job_id: RecurringJobId,
+    schedule: Option<Schedule>,
+    max_retries: Option<MaxRetries>,
+  ) -> Result<(), QueryError> {
+    let (responder, response_rx) = oneshot::channel();
+    let update_data = JobUpdateData {
+      schedule,
+      max_retries,
+    };
+    let cmd = CoordinatorCommand::UpdateJob {
+      job_id,
+      update_data,
+      responder,
+    };
+    self
+      .cmd_tx
+      .send(cmd)
+      .await
+      .map_err(|_| QueryError::SchedulerShutdown)?;
+    response_rx.await.map_err(|_| QueryError::ResponseFailed)? // Unpack inner Result
+  }
+
+  /// Manually triggers a job lineage to run as soon as possible.
+  ///
+  /// Creates a new job instance and schedules it for immediate execution if a worker
+  /// is available. This does not affect the job's regular schedule.
+  ///
+  /// # Constraints
+  ///
+  /// - The job must exist.
+  /// - The job must not be marked as cancelled.
+  /// - The job must not currently have an instance scheduled or running (to prevent
+  ///   multiple simultaneous manual triggers piling up - this could be relaxed later).
+  ///
+  /// # Errors
+  ///
+  /// - [`QueryError::SchedulerShutdown`]: Scheduler is not running.
+  /// - [`QueryError::ResponseFailed`]: Coordinator failed to respond.
+  /// - [`QueryError::JobNotFound`]: No job with the given ID exists.
+  /// - [`QueryError::TriggerFailedJobCancelled`]: The job is cancelled.
+  /// - [`QueryError::TriggerFailedJobScheduled`]: The job already has an instance scheduled or running.
+  /// - [`QueryError::TriggerFailed`]: Internal error during trigger.
+  pub async fn trigger_job_now(&self, job_id: RecurringJobId) -> Result<(), QueryError> {
+    let (responder, response_rx) = oneshot::channel();
+    let cmd = CoordinatorCommand::TriggerJobNow { job_id, responder };
     self
       .cmd_tx
       .send(cmd)
