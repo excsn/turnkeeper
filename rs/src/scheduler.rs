@@ -260,6 +260,49 @@ impl TurnKeeper {
     SchedulerBuilder::new()
   }
 
+  /// This function panics if called within an asynchronous execution context.
+  /// 
+  /// Attempts to submit a job for scheduling, returning its unique lineage ID on success.
+  ///
+  /// This method is blocking. If the internal staging buffer is full,
+  /// it blocks until spot is opened.
+  ///
+  /// The `exec_fn` must be `Send + Sync + 'static`. It will be wrapped in an `Arc`
+  /// internally for efficient sharing with workers.
+  ///
+  /// # Errors
+  ///
+  /// - [`SubmitError::StagingFull`]: The staging buffer is full. The tuple contains the original request and function.
+  /// - [`SubmitError::ChannelClosed`]: The scheduler is shutting down or has panicked.
+  pub fn add_job<F>(
+    &self,
+    request: RecurringJobRequest,
+    exec_fn: F,
+  ) -> Result<RecurringJobId, SubmitError<(RecurringJobRequest, Arc<BoxedExecFn>)>>
+  // <-- Return ID
+  where
+    F: Fn() -> Pin<Box<dyn Future<Output = bool> + Send + 'static>> + Send + Sync + 'static,
+  {
+    // *** Generate ID before sending ***
+    let lineage_id = Uuid::new_v4();
+    let boxed_fn = Arc::new(Box::new(exec_fn) as BoxedExecFn);
+    self
+      .metrics
+      .staging_submitted_total
+      .fetch_add(1, AtomicOrdering::Relaxed);
+
+    let send_payload = (lineage_id, request, boxed_fn);
+
+    match self.staging_tx.blocking_send(send_payload) {
+      // Return the generated ID on success
+      Ok(()) => Ok(lineage_id),
+      Err(mpsc::error::SendError((_, req, func))) => {
+        // Return original request/fn tuple in error
+        Err(SubmitError::ChannelClosed((req, func)))
+      }
+    }
+  }
+
   /// Attempts to submit a job for scheduling, returning its unique lineage ID on success.
   ///
   /// This method is non-blocking. If the internal staging buffer is full,
