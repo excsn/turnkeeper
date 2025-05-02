@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tracing::{error, info};
 use turnkeeper::{
-  job::{RecurringJobRequest, Schedule}, // Import Schedule to check details
+  job::{TKJobRequest, Schedule}, // Import Schedule to check details
   job_fn,                               // Import the helper macro
   scheduler::PriorityQueueType,
   TurnKeeper,
@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   // Cron expression for every 2 seconds (requires 7 fields for seconds precision)
   let cron_expr = "*/2 * * * * * *";
   info!("Using CRON expression: '{}'", cron_expr);
-  let job_req = RecurringJobRequest::from_cron(
+  let job_req = TKJobRequest::from_cron(
     "Cron Job Every 2s",
     cron_expr,
     0, // No retries
@@ -65,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
       {
           use turnkeeper::job_context;
           let ctx = job_context!();
-          info!("  Context: Job {}, Instance {}", ctx.recurring_job_id, ctx.instance_id);
+          info!("  Context: Job {}, Instance {}", ctx.tk_job_id, ctx.instance_id);
       }
       tokio::time::sleep(StdDuration::from_millis(50)).await;
       true // Indicate success

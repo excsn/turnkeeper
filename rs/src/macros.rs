@@ -39,7 +39,7 @@
 ///     }
 /// };
 /// # let scheduler: turnkeeper::TurnKeeper = todo!(); // Placeholder for example
-/// # let request: turnkeeper::job::RecurringJobRequest = todo!(); // Placeholder
+/// # let request: turnkeeper::job::TKJobRequest = todo!(); // Placeholder
 /// # tokio_test::block_on(scheduler.add_job_async(request.clone(), job_fn_1));
 /// # tokio_test::block_on(scheduler.add_job_async(request, job_fn_2));
 /// ```

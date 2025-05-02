@@ -1,5 +1,5 @@
 use crate::error::QueryError;
-use crate::job::{InstanceId, JobDetails, JobSummary, MaxRetries, RecurringJobId, Schedule};
+use crate::job::{InstanceId, JobDetails, JobSummary, MaxRetries, TKJobId, Schedule};
 use crate::metrics::MetricsSnapshot;
 
 use chrono::{DateTime, Utc};
@@ -22,7 +22,7 @@ pub struct JobUpdateData {
 pub(crate) enum CoordinatorCommand {
   /// Request detailed information about a specific job lineage.
   GetJobDetails {
-    job_id: RecurringJobId,
+    job_id: TKJobId,
     /// Channel to send the `Result<JobDetails, QueryError>` back.
     responder: oneshot::Sender<Result<JobDetails, QueryError>>,
   },
@@ -40,7 +40,7 @@ pub(crate) enum CoordinatorCommand {
   },
   /// Request cancellation of a specific job lineage.
   CancelJob {
-    job_id: RecurringJobId,
+    job_id: TKJobId,
     /// Channel to send the `Result<(), QueryError>` back.
     /// `Ok(())` indicates the cancellation was processed (idempotent).
     /// `Err(QueryError::JobNotFound)` if the lineage ID was never known.
@@ -49,14 +49,14 @@ pub(crate) enum CoordinatorCommand {
   /// Request updating the schedule or parameters of a job.
   /// Requires the `HandleBased` priority queue.
   UpdateJob {
-    job_id: RecurringJobId,
+    job_id: TKJobId,
     update_data: JobUpdateData,
     /// Channel to send the `Result<(), QueryError>` back.
     responder: oneshot::Sender<Result<(), QueryError>>,
   },
   /// Manually trigger a job to run now (if possible).
   TriggerJobNow {
-      job_id: RecurringJobId,
+      job_id: TKJobId,
       responder: oneshot::Sender<Result<(), QueryError>>, // Ok if scheduled, Err if not found/running etc.
   },
 }
@@ -81,7 +81,7 @@ pub(crate) enum WorkerOutcome {
   /// and needs to be rescheduled for a future run.
   Reschedule {
     /// The lineage ID of the job.
-    lineage_id: RecurringJobId,
+    lineage_id: TKJobId,
     /// The specific instance ID that just completed execution.
     completed_instance_id: InstanceId,
     /// The calculated time for the next run (either regular schedule or retry backoff).
@@ -93,7 +93,7 @@ pub(crate) enum WorkerOutcome {
   /// further runs currently scheduled based on its configuration.
   Complete {
     /// The lineage ID of the job.
-    lineage_id: RecurringJobId,
+    lineage_id: TKJobId,
     /// The specific instance ID that just completed execution.
     completed_instance_id: InstanceId,
     /// Indicates if completion was due to permanent failure (exhausted retries).
@@ -105,6 +105,6 @@ pub(crate) enum WorkerOutcome {
     /// The instance ID the worker was attempting to fetch.
     instance_id: InstanceId,
     /// The lineage ID the worker was attempting to fetch.
-    lineage_id: RecurringJobId,
+    lineage_id: TKJobId,
   },
 }

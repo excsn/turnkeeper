@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tracing::{error, info};
-use turnkeeper::{job::RecurringJobRequest, job_fn, scheduler::PriorityQueueType, TurnKeeper};
+use turnkeeper::{job::TKJobRequest, job_fn, scheduler::PriorityQueueType, TurnKeeper};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -32,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
   // --- Define Job ---
   let interval = StdDuration::from_secs(2);
-  let mut job_req = RecurringJobRequest::from_interval(
+  let mut job_req = TKJobRequest::from_interval(
     "Cancel Me Recurring",
     interval,
     0, // No retries needed
@@ -51,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
           use turnkeeper::job_context;
           let ctx = job_context!();
-          info!("  Context: Job {}, Instance {}", ctx.recurring_job_id, ctx.instance_id);
+          info!("  Context: Job {}, Instance {}", ctx.tk_job_id, ctx.instance_id);
         }
         tokio::time::sleep(StdDuration::from_millis(50)).await;
         true // Indicate success

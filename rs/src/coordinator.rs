@@ -1,8 +1,8 @@
 use crate::command::{CoordinatorCommand, JobUpdateData, ShutdownMode, WorkerOutcome};
 use crate::error::QueryError;
 use crate::job::{
-  BoxedExecFn, InstanceId, JobDefinition, JobDetails, JobSummary, MaxRetries, RecurringJobId,
-  RecurringJobRequest,
+  BoxedExecFn, InstanceId, JobDefinition, JobDetails, JobSummary, MaxRetries, TKJobId,
+  TKJobRequest,
 };
 use crate::metrics::SchedulerMetrics;
 use crate::scheduler::PriorityQueueType;
@@ -21,23 +21,23 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
-type JobDispatchTuple = (InstanceId, RecurringJobId, DateTime<Utc>);
+type JobDispatchTuple = (InstanceId, TKJobId, DateTime<Utc>);
 
 /// Internal state shared and managed by the Coordinator task.
 #[derive(Debug)] // Avoid Clone if not needed
 pub(crate) struct CoordinatorState {
   pq_type: PriorityQueueType,
   // Receivers
-  staging_rx: mpsc::Receiver<(RecurringJobId, RecurringJobRequest, Arc<BoxedExecFn>)>,
+  staging_rx: mpsc::Receiver<(TKJobId, TKJobRequest, Arc<BoxedExecFn>)>,
   cmd_rx: mpsc::Receiver<CoordinatorCommand>,
   shutdown_rx: watch::Receiver<Option<ShutdownMode>>,
   worker_outcome_rx: mpsc::Receiver<WorkerOutcome>,
   // Sender
   job_dispatch_tx: async_channel::Sender<JobDispatchTuple>,
   // Shared Data Structures (protected by locks)
-  job_definitions: Arc<RwLock<HashMap<RecurringJobId, JobDefinition>>>,
-  cancellations: Arc<RwLock<HashSet<RecurringJobId>>>,
-  instance_to_lineage: Arc<RwLock<HashMap<InstanceId, RecurringJobId>>>,
+  job_definitions: Arc<RwLock<HashMap<TKJobId, JobDefinition>>>,
+  cancellations: Arc<RwLock<HashSet<TKJobId>>>,
+  instance_to_lineage: Arc<RwLock<HashMap<InstanceId, TKJobId>>>,
   // Metrics & Counters
   metrics: SchedulerMetrics,
   active_workers_counter: Arc<AtomicUsize>,
@@ -48,14 +48,14 @@ impl CoordinatorState {
   #[allow(clippy::too_many_arguments)] // Necessary complexity for Coordinator setup
   pub fn new(
     pq_type: PriorityQueueType,
-    staging_rx: mpsc::Receiver<(RecurringJobId, RecurringJobRequest, Arc<BoxedExecFn>)>,
+    staging_rx: mpsc::Receiver<(TKJobId, TKJobRequest, Arc<BoxedExecFn>)>,
     cmd_rx: mpsc::Receiver<CoordinatorCommand>,
     shutdown_rx: watch::Receiver<Option<ShutdownMode>>,
     job_dispatch_tx: async_channel::Sender<JobDispatchTuple>,
     worker_outcome_rx: mpsc::Receiver<WorkerOutcome>,
-    job_definitions: Arc<RwLock<HashMap<RecurringJobId, JobDefinition>>>,
-    cancellations: Arc<RwLock<HashSet<RecurringJobId>>>,
-    instance_to_lineage: Arc<RwLock<HashMap<InstanceId, RecurringJobId>>>,
+    job_definitions: Arc<RwLock<HashMap<TKJobId, JobDefinition>>>,
+    cancellations: Arc<RwLock<HashSet<TKJobId>>>,
+    instance_to_lineage: Arc<RwLock<HashMap<InstanceId, TKJobId>>>,
     metrics: SchedulerMetrics,
     active_workers_counter: Arc<AtomicUsize>,
     max_workers: usize,
@@ -335,8 +335,8 @@ impl Coordinator {
   /// Handles processing a new job request received from the staging channel.
   async fn handle_new_job(
     &mut self,
-    lineage_id: RecurringJobId,
-    mut request: RecurringJobRequest,
+    lineage_id: TKJobId,
+    mut request: TKJobRequest,
     exec_fn: Arc<BoxedExecFn>,
   ) {
     self
@@ -646,7 +646,7 @@ impl Coordinator {
   /// Handles the logic for the UpdateJob command.
   async fn handle_update_job(
     &mut self,
-    job_id: RecurringJobId,
+    job_id: TKJobId,
     update_data: JobUpdateData,
   ) -> Result<(), QueryError> {
     // 1. Ensure we're using a handle‐based PQ
@@ -742,7 +742,7 @@ impl Coordinator {
   }
 
   /// Handles the logic for the TriggerJobNow command.
-  async fn handle_trigger_job_now(&mut self, job_id: RecurringJobId) -> Result<(), QueryError> {
+  async fn handle_trigger_job_now(&mut self, job_id: TKJobId) -> Result<(), QueryError> {
     // ——————————————————————————————————————————————
     // 1) Read‐lock and existence/cancellation checks (unchanged)
     let definitions = self.state.job_definitions.read().await;
@@ -857,7 +857,7 @@ impl Coordinator {
           };
 
           // Find lineage and check cancellation
-          let lineage_id_opt: Option<RecurringJobId> = {
+          let lineage_id_opt: Option<TKJobId> = {
             let i_to_l_map = self.state.instance_to_lineage.read().await;
             i_to_l_map.get(&ready_instance_id).copied()
           };
@@ -1023,7 +1023,7 @@ impl Coordinator {
 
   /// Helper to remove instance ID from instance->lineage map and clear JobDefinition state.
   /// Called *after* a job instance is popped and confirmed processed (dispatched, cancelled, or failed dispatch).
-  async fn cleanup_instance_maps(&self, instance_id: InstanceId, lineage_id: RecurringJobId) {
+  async fn cleanup_instance_maps(&self, instance_id: InstanceId, lineage_id: TKJobId) {
     trace!(%instance_id, %lineage_id, "Cleaning up instance maps.");
     // Remove from instance->lineage map
     {

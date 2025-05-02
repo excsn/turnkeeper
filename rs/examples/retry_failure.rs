@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tracing::{error, info};
 use turnkeeper::{
-  job::{MaxRetries, RecurringJobRequest, Schedule}, // Import MaxRetries
+  job::{MaxRetries, TKJobRequest, Schedule}, // Import MaxRetries
   job_fn,
   scheduler::PriorityQueueType,
   TurnKeeper,
@@ -38,14 +38,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
   // --- Define Job ---
   // Job fails twice, then succeeds on the 3rd attempt (attempt indexes 0, 1 fail)
-  let job_req = RecurringJobRequest::from_once(
+  let job_req = TKJobRequest::from_once(
     // Using from_once for simplicity
     "Retry Failing Job",
     Utc::now() + ChronoDuration::milliseconds(100), // Schedule initial run soon
     max_retries,
   );
   // Optional: Test fixed retry delay
-  // let job_req = RecurringJobRequest::with_fixed_retry_delay(
+  // let job_req = TKJobRequest::with_fixed_retry_delay(
   //     "Retry Failing Job Fixed",
   //     Schedule::Once(Utc::now() + ChronoDuration::milliseconds(100)),
   //     max_retries,
@@ -69,7 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
           {
               use turnkeeper::job_context;
               let ctx = job_context!();
-              info!("  Context: Job {}, Instance {}", ctx.recurring_job_id, ctx.instance_id);
+              info!("  Context: Job {}, Instance {}", ctx.tk_job_id, ctx.instance_id);
           }
 
           tokio::time::sleep(StdDuration::from_millis(10)).await;

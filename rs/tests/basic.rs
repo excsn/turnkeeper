@@ -12,7 +12,7 @@ use std::time::Duration as StdDuration;
 use crate::common::{build_scheduler, job_exec_counter_result, job_exec_flag, setup_tracing};
 use chrono::{Duration as ChronoDuration, Utc};
 
-use turnkeeper::{job::RecurringJobRequest, scheduler::PriorityQueueType, TurnKeeper, Schedule};
+use turnkeeper::{job::TKJobRequest, scheduler::PriorityQueueType, TurnKeeper, Schedule};
 
 #[tokio::test]
 async fn test_one_time_job() {
@@ -21,7 +21,7 @@ async fn test_one_time_job() {
   let executed = Arc::new(AtomicBool::new(false));
 
   let run_time = Utc::now() + ChronoDuration::milliseconds(150);
-  let req = RecurringJobRequest::from_once("One Time", run_time, 0);
+  let req = TKJobRequest::from_once("One Time", run_time, 0);
 
   let job_id = scheduler
     .add_job_async(req, job_exec_flag(executed.clone(), StdDuration::ZERO))
@@ -54,7 +54,7 @@ async fn test_simple_interval_job() {
 
   // Schedule to run roughly every 500ms using interval
   let interval = StdDuration::from_millis(500);
-  let mut req = RecurringJobRequest::from_interval("Interval Basic", interval, 0);
+  let mut req = TKJobRequest::from_interval("Interval Basic", interval, 0);
   // Start the first run very soon
   let start_time = Utc::now() + ChronoDuration::milliseconds(100);
   req.with_initial_run_time(start_time);
@@ -109,10 +109,10 @@ async fn test_job_submission_backpressure() {
   let flag3 = Arc::new(AtomicBool::new(false));
 
   // Schedule type doesn't matter here, use `never` for simplicity
-  let mut req1 = RecurringJobRequest::never("BP Job 1", 0);
+  let mut req1 = TKJobRequest::never("BP Job 1", 0);
   req1.with_initial_run_time(Utc::now() + ChronoDuration::seconds(1));
-  let req2 = RecurringJobRequest::never("BP Job 2", 0);
-  let req3 = RecurringJobRequest::never("BP Job 3", 0);
+  let req2 = TKJobRequest::never("BP Job 2", 0);
+  let req3 = TKJobRequest::never("BP Job 3", 0);
 
   // Submit first job - should succeed
   let res1 = scheduler.try_add_job(req1, job_exec_flag(flag1.clone(), StdDuration::ZERO));

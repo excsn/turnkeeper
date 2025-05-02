@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tracing::{error, info};
-use turnkeeper::{job::RecurringJobRequest, scheduler::PriorityQueueType, TurnKeeper};
+use turnkeeper::{job::TKJobRequest, scheduler::PriorityQueueType, TurnKeeper};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   // --- Define Job ---
   // Create request with an EMPTY schedule
   let run_time = Utc::now() + ChronoDuration::seconds(2);
-  let job_req = RecurringJobRequest::from_once(
+  let job_req = TKJobRequest::from_once(
     "One Time Job",
     run_time,
     0, // No retries needed for this example

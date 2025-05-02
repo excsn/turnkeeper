@@ -30,7 +30,7 @@
 //! ```no_run
 //! use turnkeeper::{
 //!     TurnKeeper,
-//!     job::{RecurringJobRequest, Schedule}, // Import Schedule if using directly
+//!     job::{TKJobRequest, Schedule}, // Import Schedule if using directly
 //!     scheduler::PriorityQueueType
 //! };
 //! use chrono::{NaiveTime, Weekday, Duration as ChronoDuration, Utc};
@@ -55,7 +55,7 @@
 //!     let job_id_store = Arc::new(tokio::sync::Mutex::new(None::<Uuid>));
 //!
 //!     // --- Add a job (Example using WeekdayTimes via helper) ---
-//!     let mut job_req = RecurringJobRequest::from_week_day(
+//!     let mut job_req = TKJobRequest::from_week_day(
 //!         "Weekday Job",
 //!         vec![(Weekday::Mon, NaiveTime::from_hms_opt(9, 0, 0).unwrap())], // Monday 9 AM UTC
 //!         3 // Max retries
@@ -64,7 +64,7 @@
 //!     job_req.with_initial_run_time(Utc::now() + ChronoDuration::seconds(1));
 //!
 //!     // --- Add an interval job ---
-//!     let interval_req = RecurringJobRequest::from_interval(
+//!     let interval_req = TKJobRequest::from_interval(
 //!         "Interval Job",
 //!         StdDuration::from_secs(30), // Run every 30 seconds
 //!         1 // Max retries
@@ -74,7 +74,7 @@
 //!     // --- Add a CRON job (runs every minute) ---
 //!     // Requires the `cron_schedule` feature to be enabled
 //!     #[cfg(feature = "cron_schedule")]
-//!     let cron_req = RecurringJobRequest::from_cron(
+//!     let cron_req = TKJobRequest::from_cron(
 //!         "Cron Job",
 //!         "0 * * * * * *", // Every minute at second 0 (adjust as needed)
 //!         0 // No retries
@@ -93,7 +93,7 @@
 //!         {
 //!             use turnkeeper::try_get_current_job_context;
 //!             if let Some(ctx) = try_get_current_job_context() {
-//!                 println!("  Context: Job {}, Instance {}", ctx.recurring_job_id, ctx.instance_id);
+//!                 println!("  Context: Job {}, Instance {}", ctx.tk_job_id, ctx.instance_id);
 //!             }
 //!         }
 //!         // --- End Optional Context Access ---
@@ -184,7 +184,7 @@
 //!
 //! # Job Lifecycle & State
 //!
-//! - Jobs are defined by [`RecurringJobRequest`], specifying the schedule type via [`Schedule`].
+//! - Jobs are defined by [`TKJobRequest`], specifying the schedule type via [`Schedule`].
 //! - Use constructors like `from_week_day`, `from_interval`, `from_once`, `never`.
 //! - Use `from_cron` requires the `cron_schedule` feature.
 //! - The scheduler manages job state internally, including retry counts and the next scheduled run time (`next_run_time` in `JobDetails`).
@@ -227,11 +227,11 @@ pub mod job_context_docs {
     //! let job_fn = || Box::pin(async {
     //!     // Optional access:
     //!     if let Some(ctx) = try_get_current_job_context() {
-    //!         println!("  Context found: Job ID {}, Instance ID {}", ctx.recurring_job_id, ctx.instance_id);
+    //!         println!("  Context found: Job ID {}, Instance ID {}", ctx.tk_job_id, ctx.instance_id);
     //!     }
     //!     // Required access (panics if run outside TurnKeeper worker context):
     //!     let required_ctx = job_context!();
-    //!     println!("  Required context: Job ID {}", required_ctx.recurring_job_id);
+    //!     println!("  Required context: Job ID {}", required_ctx.tk_job_id);
     //!
     //!     tokio::time::sleep(Duration::from_millis(50)).await;
     //!     true // Indicate success
@@ -264,7 +264,7 @@ pub use error::{BuildError, QueryError, ShutdownError, SubmitError};
 // Job related types
 pub use job::{
   // Core types
-  BoxedExecFn, InstanceId, JobDetails, JobSummary, RecurringJobId, RecurringJobRequest, Schedule,
+  BoxedExecFn, InstanceId, JobDetails, JobSummary, TKJobId, TKJobRequest, Schedule,
 };
 // Conditionally export context items
 #[cfg(feature = "job_context")]

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
-use turnkeeper::{job::RecurringJobRequest, scheduler::PriorityQueueType, TurnKeeper};
+use turnkeeper::{job::TKJobRequest, scheduler::PriorityQueueType, TurnKeeper};
 use uuid::Uuid;
 
 // Helper to find the next occurrence of a specific time today or tomorrow
@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   // --- Job 1 (Scheduled to run soon) ---
   let job1_schedule = schedule_in_near_future(2); // Schedule ~2-3 seconds from now
   info!("Job 1 schedule: {:?}", job1_schedule);
-  let job1_req = RecurringJobRequest::from_week_day("Job 1 (Runs Soon)", job1_schedule.clone(), 0);
+  let job1_req = TKJobRequest::from_week_day("Job 1 (Runs Soon)", job1_schedule.clone(), 0);
   let job1_ids_clone = job_ids.clone();
   let job1_run_count = job_run_count.clone();
   let job1_fn = move || {
@@ -68,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   // --- Job 2 (Scheduled further out, will be cancelled) ---
   let job2_schedule = schedule_in_near_future(60); // Schedule ~1 minute from now
   info!("Job 2 schedule: {:?}", job2_schedule);
-  let job2_req = RecurringJobRequest::from_week_day("Job 2 (To Be Cancelled)", job2_schedule, 0);
+  let job2_req = TKJobRequest::from_week_day("Job 2 (To Be Cancelled)", job2_schedule, 0);
   let job2_ids_clone = job_ids.clone();
   let job2_fn = || {
     Box::pin(async move {

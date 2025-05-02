@@ -1,4 +1,4 @@
-use super::{InstanceId, RecurringJobId};
+use super::{InstanceId, TKJobId};
 
 /// Contextual information available to a running job instance via task-locals.
 /// Accessible within a `BoxedExecFn` using `try_get_current_job_context()`
@@ -6,7 +6,7 @@ use super::{InstanceId, RecurringJobId};
 #[derive(Clone, Copy, Debug)]
 pub struct JobContext {
   /// The unique lineage ID of the recurring job definition.
-  pub recurring_job_id: RecurringJobId,
+  pub tk_job_id: TKJobId,
   /// The unique ID of this specific execution instance.
   pub instance_id: InstanceId,
 }

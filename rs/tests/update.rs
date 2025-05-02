@@ -14,7 +14,7 @@ use std::sync::{
 };
 use std::time::Duration as StdDuration;
 use turnkeeper::{
-  job::{MaxRetries, RecurringJobRequest, Schedule},
+  job::{MaxRetries, TKJobRequest, Schedule},
   job_fn, // Use the macro
   scheduler::PriorityQueueType,
   QueryError,
@@ -30,7 +30,7 @@ async fn test_update_job_schedule_success() {
 
   // 1. Add job scheduled far out
   let initial_schedule = Schedule::Once(Utc::now() + ChronoDuration::days(1));
-  let job_req = RecurringJobRequest::new("Update Schedule Target", initial_schedule.clone(), 0);
+  let job_req = TKJobRequest::new("Update Schedule Target", initial_schedule.clone(), 0);
   let job_id = scheduler
     .add_job_async(
       job_req,
@@ -82,7 +82,7 @@ async fn test_update_job_max_retries_success() {
 
   // 1. Add job
   let initial_max_retries: MaxRetries = 1;
-  let job_req = RecurringJobRequest::new(
+  let job_req = TKJobRequest::new(
     "Update Retries Target",
     Schedule::Never, // Schedule doesn't matter
     initial_max_retries,
@@ -119,7 +119,7 @@ async fn test_update_job_wrong_pq_type() {
   // Use BinaryHeap which doesn't support updates
   let scheduler = build_scheduler(1, PriorityQueueType::BinaryHeap).unwrap();
 
-  let job_req = RecurringJobRequest::new("Wrong PQ Update", Schedule::Never, 0);
+  let job_req = TKJobRequest::new("Wrong PQ Update", Schedule::Never, 0);
   let job_id = scheduler
     .add_job_async(job_req, job_fn!({ true }))
     .await
@@ -167,7 +167,7 @@ async fn test_update_cancelled_job() {
 
   // 1. Add job scheduled far out
   let initial_schedule = Schedule::Once(Utc::now() + ChronoDuration::days(1));
-  let job_req = RecurringJobRequest::new("Update Cancelled", initial_schedule.clone(), 0);
+  let job_req = TKJobRequest::new("Update Cancelled", initial_schedule.clone(), 0);
   let job_id = scheduler
     .add_job_async(job_req, job_exec_flag(flag.clone(), StdDuration::ZERO))
     .await

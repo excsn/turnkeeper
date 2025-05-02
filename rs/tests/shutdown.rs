@@ -15,7 +15,7 @@ use std::{
   },
 };
 use tracing::{info, warn};
-use turnkeeper::{job::RecurringJobRequest, scheduler::PriorityQueueType};
+use turnkeeper::{job::TKJobRequest, scheduler::PriorityQueueType};
 
 #[tokio::test]
 async fn test_graceful_shutdown_waits_for_job() {
@@ -44,7 +44,7 @@ async fn test_graceful_shutdown_waits_for_job() {
     }
   };
 
-  let req = RecurringJobRequest::from_once("Graceful Wait", Utc::now() + ChronoDuration::milliseconds(100), 0);
+  let req = TKJobRequest::from_once("Graceful Wait", Utc::now() + ChronoDuration::milliseconds(100), 0);
 
   scheduler
     .add_job_async(req, job_fn)
@@ -117,7 +117,7 @@ async fn test_force_shutdown_interrupts() {
   };
 
   let run_time = Utc::now() + ChronoDuration::milliseconds(100);
-  let req = RecurringJobRequest::from_once("Force Interrupt", run_time, 0);
+  let req = TKJobRequest::from_once("Force Interrupt", run_time, 0);
 
   scheduler
     .add_job_async(req, job_fn)

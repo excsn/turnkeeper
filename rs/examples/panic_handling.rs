@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tracing::{error, info};
 use turnkeeper::{
-  job::{MaxRetries, RecurringJobRequest},
+  job::{MaxRetries, TKJobRequest},
   job_fn,
   scheduler::PriorityQueueType,
   TurnKeeper,
@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   let max_retries: MaxRetries = 1; // Allow one retry after panic
 
   // --- Define Job That Panics ---
-  let job_req = RecurringJobRequest::from_once(
+  let job_req = TKJobRequest::from_once(
     // Use from_once for simplicity
     "Panicking Job",
     Utc::now() + ChronoDuration::milliseconds(100), // Schedule initial run soon
@@ -54,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
           use turnkeeper::job_context;
           let ctx = job_context!();
-          info!("  Context: Job {}, Instance {}", ctx.recurring_job_id, ctx.instance_id);
+          info!("  Context: Job {}, Instance {}", ctx.tk_job_id, ctx.instance_id);
         }
 
         tokio::task::yield_now().await; // Ensure potential cancellation point

@@ -11,7 +11,7 @@ use std::sync::{
 };
 use std::time::Duration as StdDuration;
 use turnkeeper::{
-  job::{RecurringJobRequest, Schedule},
+  job::{TKJobRequest, Schedule},
   job_fn, // Use the macro
   scheduler::PriorityQueueType,
   QueryError,
@@ -26,7 +26,7 @@ async fn test_trigger_job_success() {
   let counter = Arc::new(AtomicUsize::new(0));
 
   // 1. Add job with Never schedule (or far future)
-  let job_req = RecurringJobRequest::new("Trigger Me", Schedule::Never, 0);
+  let job_req = TKJobRequest::new("Trigger Me", Schedule::Never, 0);
   let job_id = scheduler
     .add_job_async(
       job_req,
@@ -91,7 +91,7 @@ async fn test_trigger_job_cancelled() {
   let scheduler = build_scheduler(1, PriorityQueueType::BinaryHeap).unwrap();
 
   // 1. Add and cancel job
-  let job_req = RecurringJobRequest::new("Trigger Cancelled", Schedule::Never, 0);
+  let job_req = TKJobRequest::new("Trigger Cancelled", Schedule::Never, 0);
   let job_id = scheduler
     .add_job_async(job_req, job_fn!({ true }))
     .await
@@ -120,7 +120,7 @@ async fn test_trigger_job_already_scheduled() {
 
   // 1. Add a job scheduled to run soon (but after our trigger attempt)
   let run_time = Utc::now() + ChronoDuration::seconds(5); // Scheduled 5s out
-  let job_req = RecurringJobRequest::new("Trigger Scheduled", Schedule::Once(run_time), 0);
+  let job_req = TKJobRequest::new("Trigger Scheduled", Schedule::Once(run_time), 0);
   let job_id = scheduler
     .add_job_async(job_req, job_exec_flag(flag.clone(), StdDuration::ZERO))
     .await
@@ -155,7 +155,7 @@ async fn test_trigger_job_interacts_with_schedule() {
 
   // 1. Add an interval job (e.g., every 2 seconds) starting in 1s
   let interval = StdDuration::from_secs(2);
-  let mut job_req = RecurringJobRequest::from_interval("Trigger Interval", interval, 0);
+  let mut job_req = TKJobRequest::from_interval("Trigger Interval", interval, 0);
   job_req.with_initial_run_time(Utc::now() + ChronoDuration::seconds(1));
 
   let job_id = scheduler

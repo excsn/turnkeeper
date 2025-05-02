@@ -11,7 +11,7 @@ use std::sync::{
   Arc,
 };
 use std::time::Duration as StdDuration;
-use turnkeeper::{job::RecurringJobRequest, scheduler::PriorityQueueType};
+use turnkeeper::{job::TKJobRequest, scheduler::PriorityQueueType};
 
 #[tokio::test]
 async fn test_max_worker_limit() {
@@ -28,7 +28,7 @@ async fn test_max_worker_limit() {
   info!("Submitting {} jobs concurrently...", job_count);
   for i in 0..job_count {
     // Use `never` schedule, rely on initial run time
-    let mut req = RecurringJobRequest::never(&format!("Conc Job {}", i), 0);
+    let mut req = TKJobRequest::never(&format!("Conc Job {}", i), 0);
     req.with_initial_run_time(Utc::now() + ChronoDuration::milliseconds(50));
 
     let job_fn =

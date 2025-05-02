@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tracing::{error, info, warn, Level};
-use turnkeeper::{job::RecurringJobRequest, job_fn, scheduler::PriorityQueueType, TurnKeeper};
+use turnkeeper::{job::TKJobRequest, job_fn, scheduler::PriorityQueueType, TurnKeeper};
 
 // Helper function to run the cancellation test scenario
 async fn run_cancellation_scenario(
@@ -28,7 +28,7 @@ async fn run_cancellation_scenario(
 
   // --- Define Job (scheduled way out, so cancellation is effective) ---
   let run_time = Utc::now() + ChronoDuration::seconds(30); // Schedule 30s out
-  let job_req = RecurringJobRequest::from_once(&format!("Cancel Me ({:?})", pq_type), run_time, 0);
+  let job_req = TKJobRequest::from_once(&format!("Cancel Me ({:?})", pq_type), run_time, 0);
 
   let flag_clone = executed_flag.clone();
   let job_function = job_fn!(

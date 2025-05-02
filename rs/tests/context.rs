@@ -13,7 +13,7 @@ use std::time::Duration as StdDuration;
 use chrono::{Duration as ChronoDuration, Utc};
 use tokio::sync::Mutex;
 use turnkeeper::{
-  job::RecurringJobRequest,
+  job::TKJobRequest,
   job_context, // Import the macro
   scheduler::PriorityQueueType,
   try_get_current_job_context,
@@ -50,14 +50,14 @@ async fn test_job_context_access() {
         let ctx_macro = job_context!();
         tracing::info!(
           "Context (macro): Job ID {}, Instance ID {}",
-          ctx_macro.recurring_job_id,
+          ctx_macro.tk_job_id,
           ctx_macro.instance_id
         );
 
         // Verify both methods yield the same result
         assert_eq!(
-          ctx_option.unwrap().recurring_job_id,
-          ctx_macro.recurring_job_id
+          ctx_option.unwrap().tk_job_id,
+          ctx_macro.tk_job_id
         );
         assert_eq!(ctx_option.unwrap().instance_id, ctx_macro.instance_id);
 
@@ -78,17 +78,17 @@ async fn test_job_context_access() {
   };
 
   // Schedule a job to run once, soon
-  let mut req = RecurringJobRequest::never("Context Test Job", 0);
+  let mut req = TKJobRequest::never("Context Test Job", 0);
   req.with_initial_run_time(Utc::now() + ChronoDuration::milliseconds(150));
 
   tracing::info!("Submitting context test job...");
-  let expected_recurring_id = scheduler
+  let expected_tk_id = scheduler
     .add_job_async(req, job_fn)
     .await
     .expect("Failed to add job");
   tracing::info!(
-    "Job submitted with expected RecurringJobId: {}",
-    expected_recurring_id
+    "Job submitted with expected TKJobId: {}",
+    expected_tk_id
   );
 
   // Wait for the job to execute
@@ -105,8 +105,8 @@ async fn test_job_context_access() {
   match *final_captured_context {
     Some(ctx) => {
       assert_eq!(
-        ctx.recurring_job_id, expected_recurring_id,
-        "Captured RecurringJobId does not match expected"
+        ctx.tk_job_id, expected_tk_id,
+        "Captured TKJobId does not match expected"
       );
       // InstanceId is generated internally, just check it's not nil/default
       assert_ne!(
@@ -116,7 +116,7 @@ async fn test_job_context_access() {
       );
       tracing::info!(
         "Verification successful: RecID={}, InstID={}",
-        ctx.recurring_job_id,
+        ctx.tk_job_id,
         ctx.instance_id
       );
     }
@@ -143,7 +143,7 @@ async fn test_job_context_differs_across_runs() {
         let ctx = job_context!(); // Use macro for brevity
         tracing::info!(
           "Recurring context test job: RecID={}, InstID={}",
-          ctx.recurring_job_id,
+          ctx.tk_job_id,
           ctx.instance_id
         );
         captures.lock().await.push(ctx); // Store context from this run
@@ -155,14 +155,14 @@ async fn test_job_context_differs_across_runs() {
 
   // Schedule to run every 500ms, start soon
   let interval = StdDuration::from_millis(500);
-  let mut req = RecurringJobRequest::from_interval("Recurring Context Test", interval, 0);
+  let mut req = TKJobRequest::from_interval("Recurring Context Test", interval, 0);
   req.with_initial_run_time(Utc::now() + ChronoDuration::milliseconds(100));
 
-  let expected_recurring_id = scheduler
+  let expected_tk_id = scheduler
     .add_job_async(req, job_fn)
     .await
     .expect("Failed to add recurring job");
-  tracing::info!("Recurring job submitted: {}", expected_recurring_id);
+  tracing::info!("Recurring job submitted: {}", expected_tk_id);
 
   // Let it run a few times (e.g., for 1.8 seconds to catch ~3-4 runs)
   tokio::time::sleep(StdDuration::from_millis(1800)).await;
@@ -182,11 +182,11 @@ async fn test_job_context_differs_across_runs() {
 
   let mut previous_instance_id: Option<InstanceId> = None;
   for (i, ctx) in final_contexts.iter().enumerate() {
-    // Check RecurringJobId is consistent
+    // Check TKJobId is consistent
     assert_eq!(
-      ctx.recurring_job_id,
-      expected_recurring_id,
-      "RecurringJobId mismatch on run {}",
+      ctx.tk_job_id,
+      expected_tk_id,
+      "TKJobId mismatch on run {}",
       i + 1
     );
     // Check InstanceId is not nil

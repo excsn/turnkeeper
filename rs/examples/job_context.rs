@@ -1,13 +1,13 @@
 //! examples/job_context.rs
 //!
-//! Demonstrates accessing job context (RecurringJobId, InstanceId) within
+//! Demonstrates accessing job context (TKJobId, InstanceId) within
 //! a job's execution function using the `job_context` feature.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tracing::{error, info};
-use turnkeeper::{job::RecurringJobRequest, scheduler::PriorityQueueType, TurnKeeper};
+use turnkeeper::{job::TKJobRequest, scheduler::PriorityQueueType, TurnKeeper};
 
 // --- Conditionally include context helpers ---
 // These will only be available if the `job_context` feature is enabled.
@@ -52,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
   // --- Define Job ---
   // Schedule it to run every 2 seconds using from_interval
-  let job_req = RecurringJobRequest::from_interval(
+  let job_req = TKJobRequest::from_interval(
     "Context Aware Job",
     StdDuration::from_secs(2), // Run every 2 seconds
     1,                         // Allow 1 retry on failure
@@ -74,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
       if let Some(ctx) = try_get_current_job_context() {
         info!(
           "  Context (safe access): Job ID {}, Instance ID {}",
-          ctx.recurring_job_id, ctx.instance_id
+          ctx.tk_job_id, ctx.instance_id
         );
         // You could store/use these IDs here
       } else {
@@ -87,7 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
       let required_ctx: JobContext = job_context!(); // Type annotation optional but good practice
       info!(
         "  Context (macro access): Job ID {}, Instance ID {}",
-        required_ctx.recurring_job_id, required_ctx.instance_id
+        required_ctx.tk_job_id, required_ctx.instance_id
       );
 
       // Simulate some work

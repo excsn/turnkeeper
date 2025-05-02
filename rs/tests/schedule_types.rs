@@ -11,7 +11,7 @@ use std::sync::{
 };
 use std::time::Duration as StdDuration;
 use turnkeeper::{
-  job::{RecurringJobRequest, Schedule},
+  job::{TKJobRequest, Schedule},
   scheduler::PriorityQueueType,
   QueryError,
 };
@@ -26,7 +26,7 @@ async fn test_cron_schedule() {
   // Cron expression for every 2 seconds
   let cron_expr = "*/2 * * * * * *"; // Every 2 seconds (includes seconds field)
 
-  let req = RecurringJobRequest::from_cron("Cron Test", cron_expr, 0);
+  let req = TKJobRequest::from_cron("Cron Test", cron_expr, 0);
 
   let job_id = scheduler
     .add_job_async(
@@ -67,7 +67,7 @@ async fn test_interval_schedule() {
   let counter = Arc::new(AtomicUsize::new(0));
 
   let interval = StdDuration::from_millis(750); // 750ms interval
-  let mut req = RecurringJobRequest::from_interval("Interval Test", interval, 0);
+  let mut req = TKJobRequest::from_interval("Interval Test", interval, 0);
   req.with_initial_run_time(Utc::now() + ChronoDuration::milliseconds(100)); // Start soon
 
   let job_id = scheduler
@@ -114,7 +114,7 @@ async fn test_never_schedule_no_initial_time() {
   let counter = Arc::new(AtomicUsize::new(0));
 
   // Create 'Never' job WITHOUT initial run time
-  let req = RecurringJobRequest::never("Never Run", 0);
+  let req = TKJobRequest::never("Never Run", 0);
 
   let job_id = scheduler
     .add_job_async(
@@ -171,7 +171,7 @@ async fn test_never_schedule_with_initial_time() {
   let counter = Arc::new(AtomicUsize::new(0));
 
   // Create 'Never' job WITH initial run time
-  let mut req = RecurringJobRequest::never("Never Run Once", 0);
+  let mut req = TKJobRequest::never("Never Run Once", 0);
   req.with_initial_run_time(Utc::now() + ChronoDuration::milliseconds(150));
 
   let job_id = scheduler

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tracing::{error, info};
 use turnkeeper::{
-  job::RecurringJobRequest,
+  job::TKJobRequest,
   job_fn,
   scheduler::PriorityQueueType,
   TurnKeeper,
@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   let delay = StdDuration::from_millis(25);
 
   // --- Define Job Using `job_fn!` Macro ---
-  let job_req = RecurringJobRequest::from_once(
+  let job_req = TKJobRequest::from_once(
     "Macro Defined Job",
     Utc::now() + ChronoDuration::milliseconds(100),
     0,
@@ -64,7 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
       {
           use turnkeeper::job_context;
           let ctx = job_context!();
-          info!("  Context: Job {}, Instance {}", ctx.recurring_job_id, ctx.instance_id);
+          info!("  Context: Job {}, Instance {}", ctx.tk_job_id, ctx.instance_id);
       }
 
       tokio::time::sleep(local_delay).await;

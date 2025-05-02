@@ -1,6 +1,6 @@
 use crate::command::{ShutdownMode, WorkerOutcome};
 use crate::job::{
-  BoxedExecFn, InstanceId, JobDefinition, RecurringJobId, RecurringJobRequest, WorkerId,
+  BoxedExecFn, InstanceId, JobDefinition, TKJobId, TKJobRequest, WorkerId,
 };
 use crate::metrics::SchedulerMetrics;
 
@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, watch, RwLock};
 use tracing::{debug, error, info, trace, warn, Instrument};
 
-type JobDispatchTuple = (InstanceId, RecurringJobId, DateTime<Utc>);
+type JobDispatchTuple = (InstanceId, TKJobId, DateTime<Utc>);
 
 /// Represents a worker task responsible for executing jobs.
 ///
@@ -26,7 +26,7 @@ type JobDispatchTuple = (InstanceId, RecurringJobId, DateTime<Utc>);
 /// and report the outcome back to the Coordinator.
 pub(crate) struct Worker {
   id: WorkerId, // Simple numeric ID for logging
-  job_definitions: Arc<RwLock<HashMap<RecurringJobId, JobDefinition>>>,
+  job_definitions: Arc<RwLock<HashMap<TKJobId, JobDefinition>>>,
   metrics: SchedulerMetrics,
   shutdown_rx: watch::Receiver<Option<ShutdownMode>>,
   // Channel to send job outcome back to Coordinator
@@ -42,7 +42,7 @@ impl Worker {
   #[allow(clippy::too_many_arguments)] // Necessary state for worker operation
   pub fn new(
     id: usize,
-    job_definitions: Arc<RwLock<HashMap<RecurringJobId, JobDefinition>>>,
+    job_definitions: Arc<RwLock<HashMap<TKJobId, JobDefinition>>>,
     metrics: SchedulerMetrics,
     shutdown_rx: watch::Receiver<Option<ShutdownMode>>,
     worker_outcome_tx: mpsc::Sender<WorkerOutcome>,
@@ -173,8 +173,8 @@ impl Worker {
   async fn fetch_job_details(
     &self,
     instance_id: InstanceId,
-    lineage_id: RecurringJobId,
-  ) -> Option<(Arc<BoxedExecFn>, RecurringJobRequest)> {
+    lineage_id: TKJobId,
+  ) -> Option<(Arc<BoxedExecFn>, TKJobRequest)> {
     let definitions = self.job_definitions.read().await;
     if let Some(def) = definitions.get(&lineage_id) {
       // IMPORTANT CASE
@@ -212,8 +212,8 @@ impl Worker {
   async fn execute_and_handle(
     &self,
     instance_id: InstanceId,
-    lineage_id: RecurringJobId,
-    request: RecurringJobRequest,
+    lineage_id: TKJobId,
+    request: TKJobRequest,
     exec_fn: Arc<BoxedExecFn>,
     job_start_instant: Instant,
   ) {
@@ -263,7 +263,7 @@ impl Worker {
   async fn execute_job_logic(
     &self,
     exec_fn: &Arc<BoxedExecFn>,
-    lineage_id: RecurringJobId,
+    lineage_id: TKJobId,
     instance_id: InstanceId,
   ) -> Result<bool, ()> {
     let func = exec_fn.clone();
@@ -273,7 +273,7 @@ impl Worker {
     #[cfg(feature = "job_context")]
     let task = {
       let context = JobContext {
-        recurring_job_id: lineage_id,
+        tk_job_id: lineage_id,
         instance_id,
       };
       tokio::spawn(CURRENT_JOB_CONTEXT.scope(context, future_to_run))
@@ -306,7 +306,7 @@ impl Worker {
           error!(
             "Job function panicked! Context: {:?}",
             JobContext {
-              recurring_job_id: lineage_id,
+              tk_job_id: lineage_id,
               instance_id
             }
           );
@@ -341,8 +341,8 @@ impl Worker {
   async fn handle_job_result_outcome(
     &self,
     instance_id: InstanceId, // ID of the instance that just finished
-    lineage_id: RecurringJobId,
-    original_request: RecurringJobRequest, // Base for calculations
+    lineage_id: TKJobId,
+    original_request: TKJobRequest, // Base for calculations
     result: Result<bool, ()>,              // Ok(true)=success, Ok(false)=fail, Err=panic
   ) {
     let should_retry = !matches!(result, Ok(true)); // Retry on panic or explicit false

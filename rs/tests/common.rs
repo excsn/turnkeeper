@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tracing_subscriber::fmt::TestWriter;
 use turnkeeper::{
-  job::{BoxedExecFn, RecurringJobRequest},
+  job::{BoxedExecFn, TKJobRequest},
   scheduler::{PriorityQueueType, SchedulerBuilder},
   TurnKeeper,
 };

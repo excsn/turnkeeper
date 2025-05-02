@@ -2,7 +2,7 @@ use crate::command::{CoordinatorCommand, JobUpdateData, ShutdownMode};
 use crate::coordinator::{Coordinator, CoordinatorState};
 use crate::error::{BuildError, QueryError, ShutdownError, SubmitError};
 use crate::job::{
-  BoxedExecFn, InstanceId, JobDetails, JobSummary, MaxRetries, RecurringJobId, RecurringJobRequest,
+  BoxedExecFn, InstanceId, JobDetails, JobSummary, MaxRetries, TKJobId, TKJobRequest,
 };
 use crate::metrics::{MetricsSnapshot, SchedulerMetrics};
 use crate::worker::Worker;
@@ -27,7 +27,7 @@ use uuid::Uuid;
 const DEFAULT_CHANNEL_BOUND: usize = 128; // For staging and command channels
 const DEFAULT_JOB_DISPATCH_BOUND: usize = 1; // For coordinator -> worker job dispatch
 
-type JobDispatchTuple = (InstanceId, RecurringJobId, DateTime<Utc>);
+type JobDispatchTuple = (InstanceId, TKJobId, DateTime<Utc>);
 
 /// Specifies the underlying priority queue implementation used by the scheduler.
 ///
@@ -165,8 +165,8 @@ impl SchedulerBuilder {
     let active_workers_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     let (staging_tx, staging_rx) = mpsc::channel::<(
-      RecurringJobId, // Add the ID here
-      RecurringJobRequest,
+      TKJobId, // Add the ID here
+      TKJobRequest,
       Arc<BoxedExecFn>,
     )>(self.staging_buffer_size);
 
@@ -175,7 +175,7 @@ impl SchedulerBuilder {
     let (shutdown_tx, shutdown_rx) = watch::channel::<Option<ShutdownMode>>(None);
 
     let (job_dispatch_tx, job_dispatch_rx) =
-      async_channel::bounded::<(InstanceId, RecurringJobId)>(self.job_dispatch_buffer_size);
+      async_channel::bounded::<(InstanceId, TKJobId)>(self.job_dispatch_buffer_size);
 
     let (job_dispatch_tx, job_dispatch_rx) =
       async_channel::bounded::<JobDispatchTuple>(self.job_dispatch_buffer_size);
@@ -254,7 +254,7 @@ impl SchedulerBuilder {
 pub struct TurnKeeper {
   metrics: SchedulerMetrics, // Cloneable struct containing Arcs
   // Channels for interacting with the Coordinator
-  staging_tx: mpsc::Sender<(RecurringJobId, RecurringJobRequest, Arc<BoxedExecFn>)>,
+  staging_tx: mpsc::Sender<(TKJobId, TKJobRequest, Arc<BoxedExecFn>)>,
   cmd_tx: mpsc::Sender<CoordinatorCommand>,
   shutdown_tx: watch::Sender<Option<ShutdownMode>>,
   // Task handles for graceful shutdown
@@ -284,9 +284,9 @@ impl TurnKeeper {
   /// - [`SubmitError::ChannelClosed`]: The scheduler is shutting down or has panicked.
   pub fn add_job<F>(
     &self,
-    request: RecurringJobRequest,
+    request: TKJobRequest,
     exec_fn: F,
-  ) -> Result<RecurringJobId, SubmitError<(RecurringJobRequest, Arc<BoxedExecFn>)>>
+  ) -> Result<TKJobId, SubmitError<(TKJobRequest, Arc<BoxedExecFn>)>>
   // <-- Return ID
   where
     F: Fn() -> Pin<Box<dyn Future<Output = bool> + Send + 'static>> + Send + Sync + 'static,
@@ -326,9 +326,9 @@ impl TurnKeeper {
   /// - [`SubmitError::ChannelClosed`]: The scheduler is shutting down or has panicked.
   pub fn try_add_job<F>(
     &self,
-    request: RecurringJobRequest,
+    request: TKJobRequest,
     exec_fn: F,
-  ) -> Result<RecurringJobId, SubmitError<(RecurringJobRequest, Arc<BoxedExecFn>)>>
+  ) -> Result<TKJobId, SubmitError<(TKJobRequest, Arc<BoxedExecFn>)>>
   // <-- Return ID
   where
     F: Fn() -> Pin<Box<dyn Future<Output = bool> + Send + 'static>> + Send + Sync + 'static,
@@ -372,9 +372,9 @@ impl TurnKeeper {
   /// - [`SubmitError::ChannelClosed`]: The scheduler is shutting down or has panicked.
   pub async fn add_job_async<F>(
     &self,
-    request: RecurringJobRequest,
+    request: TKJobRequest,
     exec_fn: F,
-  ) -> Result<RecurringJobId, SubmitError<(RecurringJobRequest, Arc<BoxedExecFn>)>>
+  ) -> Result<TKJobId, SubmitError<(TKJobRequest, Arc<BoxedExecFn>)>>
   // <-- Return ID
   where
     F: Fn() -> Pin<Box<dyn Future<Output = bool> + Send + 'static>> + Send + Sync + 'static,
@@ -406,7 +406,7 @@ impl TurnKeeper {
   /// - [`QueryError::SchedulerShutdown`]: Scheduler is not running.
   /// - [`QueryError::ResponseFailed`]: Coordinator failed to respond.
   /// - [`QueryError::JobNotFound`]: No job with the given ID exists.
-  pub async fn get_job_details(&self, job_id: RecurringJobId) -> Result<JobDetails, QueryError> {
+  pub async fn get_job_details(&self, job_id: TKJobId) -> Result<JobDetails, QueryError> {
     let (responder, response_rx) = oneshot::channel();
     let cmd = CoordinatorCommand::GetJobDetails { job_id, responder };
     self
@@ -469,7 +469,7 @@ impl TurnKeeper {
   /// - [`QueryError::SchedulerShutdown`]: Scheduler is not running.
   /// - [`QueryError::ResponseFailed`]: Coordinator failed to respond.
   /// - [`QueryError::JobNotFound`]: No job with the given ID exists.
-  pub async fn cancel_job(&self, job_id: RecurringJobId) -> Result<(), QueryError> {
+  pub async fn cancel_job(&self, job_id: TKJobId) -> Result<(), QueryError> {
     let (responder, response_rx) = oneshot::channel();
     let cmd = CoordinatorCommand::CancelJob { job_id, responder };
     self
@@ -502,7 +502,7 @@ impl TurnKeeper {
   /// - [`QueryError::UpdateFailed`]: Internal error during update.
   pub async fn update_job(
     &self,
-    job_id: RecurringJobId,
+    job_id: TKJobId,
     schedule: Option<Schedule>,
     max_retries: Option<MaxRetries>,
   ) -> Result<(), QueryError> {
@@ -544,7 +544,7 @@ impl TurnKeeper {
   /// - [`QueryError::TriggerFailedJobCancelled`]: The job is cancelled.
   /// - [`QueryError::TriggerFailedJobScheduled`]: The job already has an instance scheduled or running.
   /// - [`QueryError::TriggerFailed`]: Internal error during trigger.
-  pub async fn trigger_job_now(&self, job_id: RecurringJobId) -> Result<(), QueryError> {
+  pub async fn trigger_job_now(&self, job_id: TKJobId) -> Result<(), QueryError> {
     let (responder, response_rx) = oneshot::channel();
     let cmd = CoordinatorCommand::TriggerJobNow { job_id, responder };
     self

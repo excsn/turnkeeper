@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 /// Type alias for the unique identifier of a job lineage (a recurring job definition).
 /// Uses UUID v4.
-pub type RecurringJobId = Uuid;
+pub type TKJobId = Uuid;
 
 /// Type alias for the unique identifier of a specific scheduled instance of a job.
 /// Uses UUID v4.
@@ -97,7 +97,7 @@ impl Schedule {
   }
 }
 
-/// Helper function extracted from the original RecurringJobRequest::calculate_next_run logic.
+/// Helper function extracted from the original TKJobRequest::calculate_next_run logic.
 /// Calculates the next run time based *only* on Weekday/Time pairs, after the `reference_time`.
 fn calculate_next_weekday_time(
   weekday_times: &[(Weekday, NaiveTime)],
@@ -185,11 +185,11 @@ fn calculate_next_weekday_time(
 /// execution logic, and retry policy. An instance of this is typically passed to
 /// `TurnKeeper::try_add_job` or `TurnKeeper::add_job_async`.
 ///
-/// Use the [`RecurringJobRequest::new`] constructor and [`RecurringJobRequest::with_initial_run_time`]
+/// Use the [`TKJobRequest::new`] constructor and [`TKJobRequest::with_initial_run_time`]
 /// builder method to create instances.
 #[derive(Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct RecurringJobRequest {
+pub struct TKJobRequest {
   /// A descriptive name for the job (used in logging/tracing).
   pub name: String,
   /// The schedule definition (Weekday/Time, Cron, Interval, etc.).
@@ -208,15 +208,15 @@ pub struct RecurringJobRequest {
   /// The calculated next run time for this job lineage.
   /// Managed internally by the scheduler. `None` initially or after the job lineage
   /// completes all its scheduled runs or fails permanently without a future schedule.
-  /// Can be set via [`RecurringJobRequest::with_initial_run_time`] for the first run.
+  /// Can be set via [`TKJobRequest::with_initial_run_time`] for the first run.
   pub(crate) next_run: Option<DateTime<Utc>>,
 }
 
 // Manual implementation of Debug to avoid requiring Debug constraint on BoxedExecFn
 // which might be captured in closures.
-impl fmt::Debug for RecurringJobRequest {
+impl fmt::Debug for TKJobRequest {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.debug_struct("RecurringJobRequest")
+    f.debug_struct("TKJobRequest")
       .field("name", &self.name)
       .field("schedule", &self.schedule)
       .field("max_retries", &self.max_retries)
@@ -227,7 +227,7 @@ impl fmt::Debug for RecurringJobRequest {
   }
 }
 
-impl RecurringJobRequest {
+impl TKJobRequest {
   /// Creates a new job request configuration.
   ///
   /// The initial `next_run` time will be calculated by the scheduler based on the
@@ -385,11 +385,11 @@ impl RecurringJobRequest {
 /// directly exposed in the public API.
 pub(crate) struct JobDefinition {
   /// The user request configuration and current runtime state (retry count, next run).
-  pub request: RecurringJobRequest,
+  pub request: TKJobRequest,
   /// The execution logic, wrapped in Arc for cheap sharing between scheduler and workers.
   pub exec_fn: Arc<BoxedExecFn>,
   /// The unique ID for this job lineage, assigned by the scheduler upon submission.
-  pub lineage_id: RecurringJobId,
+  pub lineage_id: TKJobId,
   /// The ID of the specific instance currently scheduled in the priority queue.
   /// `None` if the job is not currently scheduled (e.g., completed, just added, cancelled).
   /// Needs careful updates by the Coordinator during scheduling and outcome processing.
@@ -416,7 +416,7 @@ impl fmt::Debug for JobDefinition {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct JobSummary {
   /// The unique lineage ID of the job.
-  pub id: RecurringJobId,
+  pub id: TKJobId,
   /// The descriptive name of the job.
   pub name: String,
   /// The next calculated run time for the lineage (if scheduled).
@@ -433,7 +433,7 @@ pub struct JobSummary {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct JobDetails {
   /// The unique lineage ID of the job.
-  pub id: RecurringJobId,
+  pub id: TKJobId,
   /// The descriptive name of the job.
   pub name: String,
   /// The configured schedule definition.

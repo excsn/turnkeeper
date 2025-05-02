@@ -10,7 +10,7 @@ use std::sync::{
   Arc,
 };
 use std::time::Duration as StdDuration;
-use turnkeeper::{job::RecurringJobRequest, scheduler::PriorityQueueType};
+use turnkeeper::{job::TKJobRequest, scheduler::PriorityQueueType};
 
 async fn run_cancellation_test(pq_type: PriorityQueueType) {
   setup_tracing();
@@ -18,7 +18,7 @@ async fn run_cancellation_test(pq_type: PriorityQueueType) {
   let executed = Arc::new(AtomicBool::new(false));
 
   // Use `never` schedule, rely on initial run time for scheduling the single event
-  let mut req = RecurringJobRequest::never("Cancel Me", 0);
+  let mut req = TKJobRequest::never("Cancel Me", 0);
   req.with_initial_run_time(Utc::now() + ChronoDuration::seconds(10)); 
 
   let job_id = scheduler

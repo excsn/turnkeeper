@@ -9,7 +9,7 @@ use std::sync::{
   Arc,
 };
 use std::time::Duration as StdDuration;
-use turnkeeper::{job::RecurringJobRequest, scheduler::PriorityQueueType, Schedule};
+use turnkeeper::{job::TKJobRequest, scheduler::PriorityQueueType, Schedule};
 
 #[tokio::test]
 async fn test_retry_scheduling_on_failure() {
@@ -40,7 +40,7 @@ async fn test_retry_scheduling_on_failure() {
   };
 
   // Use `never` schedule, rely on initial run time
-  let mut req = RecurringJobRequest::never("Retry Schedule Test", max_retries);
+  let mut req = TKJobRequest::never("Retry Schedule Test", max_retries);
   let initial_run_time = Utc::now() + ChronoDuration::milliseconds(50);
   req.with_initial_run_time(initial_run_time);
 
@@ -100,7 +100,7 @@ async fn test_permanent_failure_scheduling() {
   let counter = Arc::new(AtomicUsize::new(0));
   let max_retries = 1; // Only 1 retry allowed
 
-  let mut req = RecurringJobRequest::never("Perm Failure Schedule", max_retries);
+  let mut req = TKJobRequest::never("Perm Failure Schedule", max_retries);
   let initial_run_time = Utc::now() + ChronoDuration::milliseconds(50);
   req.with_initial_run_time(initial_run_time);
 
@@ -151,7 +151,7 @@ async fn test_panic_retry_scheduling() {
   let max_retries = 1;
 
   // Use `never` schedule, rely on initial run time
-  let mut req = RecurringJobRequest::never("Panic Schedule Test", max_retries);
+  let mut req = TKJobRequest::never("Panic Schedule Test", max_retries);
   let initial_run_time = Utc::now() + ChronoDuration::milliseconds(50);
   req.with_initial_run_time(initial_run_time);
 
@@ -193,7 +193,7 @@ async fn test_fixed_retry_delay_scheduling() {
   let fixed_delay = StdDuration::from_secs(5); // Use a short, distinct fixed delay
 
   let initial_run_time = Utc::now() + ChronoDuration::milliseconds(50);
-  let job_req = RecurringJobRequest::with_fixed_retry_delay(
+  let job_req = TKJobRequest::with_fixed_retry_delay(
     "Fixed Retry Delay Test",
     Schedule::Once(initial_run_time),
     max_retries,

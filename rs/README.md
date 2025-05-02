@@ -62,7 +62,7 @@ TurnKeeper's features:
 *   `default`: Enables `job_context` and `priority_queue_handle_based`.
 *   `job_context`: Enables task-local job context access.
 *   `priority_queue_handle_based`: Enables the `HandleBased` priority queue (required for `update_job`).
-*   `cron_schedule`: Enables `RecurringJobRequest::from_cron` (requires `cron` dependency).
+*   `cron_schedule`: Enables `TKJobRequest::from_cron` (requires `cron` dependency).
 *   `serde`: Enables Serde support for query result types (`JobDetails`, `JobSummary`, `MetricsSnapshot`) and some internal types (requires `serde` dependency).
 
 ## Quick Start Example
@@ -70,7 +70,7 @@ TurnKeeper's features:
 ```rust
 use turnkeeper::{
     TurnKeeper,
-    job::RecurringJobRequest,
+    job::TKJobRequest,
     job_fn, // Import the helper macro
     scheduler::PriorityQueueType
 };
@@ -109,13 +109,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // 3. Define job requests using different schedules
-    let job_req_once = RecurringJobRequest::from_once(
+    let job_req_once = TKJobRequest::from_once(
         "Run Once Job",
         Utc::now() + ChronoDuration::seconds(2),
         1 // Allow 1 retry on failure
     );
 
-    let mut job_req_interval = RecurringJobRequest::from_interval(
+    let mut job_req_interval = TKJobRequest::from_interval(
         "Interval Job",
         StdDuration::from_secs(5), // Run every 5 seconds
         0
@@ -168,9 +168,9 @@ Use `TurnKeeper::builder()` to configure the scheduler before starting it via `.
 *   `.command_buffer_size(usize)`: Optional. Size of the internal command buffer (queries, etc.). Default: 128.
 *   `.job_dispatch_buffer_size(usize)`: Optional. Size of the coordinator-to-worker dispatch channel. Must be >= 1. Default: 1 (provides backpressure).
 
-## Defining Jobs (`RecurringJobRequest`)
+## Defining Jobs (`TKJobRequest`)
 
-Create a `RecurringJobRequest` using specific constructors:
+Create a `TKJobRequest` using specific constructors:
 
 *   **`from_week_day(...)`**: Takes `name`, `Vec<(Weekday, NaiveTime)>` (schedule), `max_retries`. Schedule times are interpreted as UTC.
 *   **`from_cron(...)`**: Takes `name`, `&str` (cron expression), `max_retries`. Requires the `cron_schedule` feature. Expression interpreted as UTC.
@@ -206,17 +206,17 @@ type BoxedExecFn = Box<
 
 See the [API Reference Documentation on docs.rs](https://docs.rs/turnkeeper/1.1.0/turnkeeper/) for full details.
 
-*   `add_job_async` / `try_add_job` / `add_job`: Submit jobs using `RecurringJobRequest`, returns `Result<RecurringJobId, SubmitError>`. IDs (`RecurringJobId`) are generated *before* sending to the coordinator.
-*   `cancel_job`: Request lineage cancellation by `RecurringJobId`.
+*   `add_job_async` / `try_add_job` / `add_job`: Submit jobs using `TKJobRequest`, returns `Result<TKJobId, SubmitError>`. IDs (`TKJobId`) are generated *before* sending to the coordinator.
+*   `cancel_job`: Request lineage cancellation by `TKJobId`.
 *   `update_job`: Update schedule/retries for existing job (`HandleBased` PQ required).
 *   `trigger_job_now`: Manually run a job instance now.
-*   `get_job_details` / `list_all_jobs`: Query job status by `RecurringJobId` or list all. Returns details including the [`Schedule`](https://docs.rs/turnkeeper/1.1.0/turnkeeper/job/enum.Schedule.html).
+*   `get_job_details` / `list_all_jobs`: Query job status by `TKJobId` or list all. Returns details including the [`Schedule`](https://docs.rs/turnkeeper/1.1.0/turnkeeper/job/enum.Schedule.html).
 *   `get_metrics_snapshot`: Get performance counters and gauges. Includes distinct counts for lineage cancellation vs. discarded instances.
 *   `shutdown_graceful` / `shutdown_force`: Control termination with optional timeout.
 
 ## Cancellation & Updates
 
-*   `cancel_job` marks a job lineage (`RecurringJobId`) for cancellation.
+*   `cancel_job` marks a job lineage (`TKJobId`) for cancellation.
 *   If using `PriorityQueueType::HandleBased` (default), the scheduler *attempts* to proactively remove the currently scheduled instance from the queue (O log n).
 *   If using `PriorityQueueType::BinaryHeap`, the scheduled instance is only discarded when it reaches the front of the queue and is checked before dispatch.
 *   `update_job` allows changing the `Schedule` and `max_retries` of a non-cancelled job. Requires the `HandleBased` PQ type. If the schedule changes, the next instance is rescheduled accordingly.

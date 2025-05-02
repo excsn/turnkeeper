@@ -1,4 +1,4 @@
-use crate::job::{BoxedExecFn, RecurringJobId, RecurringJobRequest};
+use crate::job::{BoxedExecFn, TKJobId, TKJobRequest};
 
 use core::fmt;
 use std::sync::Arc;
@@ -18,14 +18,14 @@ pub enum BuildError {
 /// The generic type `T` usually holds the job data that failed to be submitted,
 /// allowing the caller to potentially retry.
 #[derive(Error)]
-pub enum SubmitError<T = (RecurringJobRequest, Arc<BoxedExecFn>)> {
+pub enum SubmitError<T = (TKJobRequest, Arc<BoxedExecFn>)> {
   #[error("Staging buffer is full, job rejected. Caller may retry.")]
   StagingFull(T),
   #[error("Scheduler's staging channel is closed (likely shut down or panicked).")]
   ChannelClosed(T),
 }
 
-impl fmt::Debug for SubmitError<(RecurringJobRequest, Arc<BoxedExecFn>)> {
+impl fmt::Debug for SubmitError<(TKJobRequest, Arc<BoxedExecFn>)> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
       SubmitError::StagingFull((request, _)) => f
@@ -72,17 +72,17 @@ pub enum QueryError {
   #[error("Scheduler did not respond to the query (Coordinator task may have panicked or shutdown unexpectedly).")]
   ResponseFailed,
   #[error("Job with lineage ID {0} not found.")]
-  JobNotFound(RecurringJobId),
+  JobNotFound(TKJobId),
   #[error("Job update requires the HandleBased priority queue, but BinaryHeap is configured.")]
   UpdateRequiresHandleBasedPQ,
   #[error("Cannot update job {0}: Update failed internally.")] // Generic update failure
-  UpdateFailed(RecurringJobId),
+  UpdateFailed(TKJobId),
   #[error("Cannot trigger job {0}: Job is already running or scheduled.")]
-  TriggerFailedJobScheduled(RecurringJobId),
+  TriggerFailedJobScheduled(TKJobId),
   #[error("Cannot trigger job {0}: Trigger failed internally.")] // Generic trigger failure
-  TriggerFailed(RecurringJobId),
+  TriggerFailed(TKJobId),
   #[error("Cannot trigger job {0}: Job is marked as cancelled.")]
-  TriggerFailedJobCancelled(RecurringJobId),
+  TriggerFailedJobCancelled(TKJobId),
 }
 
 // --- Shutdown Errors ---
