@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 
+## [1.2.1] - 2025-04-30
+
+### Changed
+- Terms using Recurring to TurnKeeper. TurnKeeper Jobs instead of Recurring Jobs.
+
 ## [1.2.0] - 2025-04-30
 ### Added
 - Synchronous add_job function
