@@ -66,7 +66,7 @@ async fn test_simple_interval_job() {
     )
     .await
     .expect("Failed to add job");
-  tracing::info!("Recurring job submitted: {}", job_id);
+  tracing::info!("TurnKeeper job submitted: {}", job_id);
 
   // Let it run for a few cycles (e.g., 3 seconds)
   tokio::time::sleep(StdDuration::from_secs(3)).await;

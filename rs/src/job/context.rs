@@ -5,7 +5,7 @@ use super::{InstanceId, TKJobId};
 /// or the `job_context!()` macro when the `job_context` feature is enabled.
 #[derive(Clone, Copy, Debug)]
 pub struct JobContext {
-  /// The unique lineage ID of the recurring job definition.
+  /// The unique lineage ID of the TurnKeeper job definition.
   pub tk_job_id: TKJobId,
   /// The unique ID of this specific execution instance.
   pub instance_id: InstanceId,

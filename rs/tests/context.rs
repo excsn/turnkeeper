@@ -126,7 +126,7 @@ async fn test_job_context_access() {
   }
 }
 
-// Potential future test: Ensure context is different across multiple runs of a recurring job.
+// Potential future test: Ensure context is different across multiple runs of a TurnKeeper job.
 #[tokio::test]
 async fn test_job_context_differs_across_runs() {
   setup_tracing();
@@ -142,7 +142,7 @@ async fn test_job_context_differs_across_runs() {
       Box::pin(async move {
         let ctx = job_context!(); // Use macro for brevity
         tracing::info!(
-          "Recurring context test job: RecID={}, InstID={}",
+          "TurnKeeper context test job: RecID={}, InstID={}",
           ctx.tk_job_id,
           ctx.instance_id
         );
@@ -155,14 +155,14 @@ async fn test_job_context_differs_across_runs() {
 
   // Schedule to run every 500ms, start soon
   let interval = StdDuration::from_millis(500);
-  let mut req = TKJobRequest::from_interval("Recurring Context Test", interval, 0);
+  let mut req = TKJobRequest::from_interval("TurnKeeper Context Test", interval, 0);
   req.with_initial_run_time(Utc::now() + ChronoDuration::milliseconds(100));
 
   let expected_tk_id = scheduler
     .add_job_async(req, job_fn)
     .await
-    .expect("Failed to add recurring job");
-  tracing::info!("Recurring job submitted: {}", expected_tk_id);
+    .expect("Failed to add TurnKeeper job");
+  tracing::info!("TurnKeeper job submitted: {}", expected_tk_id);
 
   // Let it run a few times (e.g., for 1.8 seconds to catch ~3-4 runs)
   tokio::time::sleep(StdDuration::from_millis(1800)).await;
@@ -172,11 +172,11 @@ async fn test_job_context_differs_across_runs() {
   // --- Verify captured contexts ---
   let final_contexts = captured_contexts.lock().await;
   let run_count = final_contexts.len();
-  tracing::info!("Recurring job ran {} times.", run_count);
+  tracing::info!("TurnKeeper job ran {} times.", run_count);
 
   assert!(
     run_count >= 3,
-    "Expected recurring job to run at least 3 times (ran {})",
+    "Expected TurnKeeper job to run at least 3 times (ran {})",
     run_count
   );
 

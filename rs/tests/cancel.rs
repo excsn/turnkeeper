@@ -89,4 +89,4 @@ async fn test_cancellation_handle_based() {
   run_cancellation_test(PriorityQueueType::HandleBased).await;
 }
 
-// TODO: Add test for cancelling a recurring job after first run but before second.
+// TODO: Add test for cancelling a TurnKeeper job after first run but before second.

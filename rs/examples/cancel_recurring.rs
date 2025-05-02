@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
       {let counter = exec_count_clone.clone();}
       {
         let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-        info!("*** Recurring Job Executing (Count: {}) ***", count);
+        info!("*** TurnKeeper Job Executing (Count: {}) ***", count);
         // Optional: Access context
         #[cfg(feature = "job_context")]
         {
@@ -59,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   );
 
   // --- Submit Job ---
-  info!("Submitting recurring job...");
+  info!("Submitting TurnKeeper job...");
   let job_id = match scheduler.add_job_async(job_req, job_function).await {
     Ok(job_id) => {
       info!("Job submitted with ID: {}", job_id);

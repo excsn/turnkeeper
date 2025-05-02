@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 // --- Public Type Aliases ---
 
-/// Type alias for the unique identifier of a job lineage (a recurring job definition).
+/// Type alias for the unique identifier of a job lineage (a TurnKeeper job definition).
 /// Uses UUID v4.
 pub type TKJobId = Uuid;
 
@@ -179,7 +179,7 @@ fn calculate_next_weekday_time(
   })
 }
 
-/// Defines the configuration for a recurring job.
+/// Defines the configuration for a TurnKeeper job.
 ///
 /// This struct holds the user-defined parameters for a job, including its schedule,
 /// execution logic, and retry policy. An instance of this is typically passed to
@@ -309,11 +309,11 @@ impl TKJobRequest {
   /// Sets a specific initial run time for the job's first execution.
   ///
   /// This is useful for scheduling one-time jobs (when `weekday_times` is empty)
-  /// or for overriding the calculated first run time for a recurring job.
+  /// or for overriding the calculated first run time for a TurnKeeper job.
   /// If set, the scheduler will use this time for the first execution instead
   /// of calculating it from `weekday_times`.
   ///
-  /// Note: Subsequent runs for recurring jobs (after the first successful execution
+  /// Note: Subsequent runs for TurnKeeper jobs (after the first successful execution
   /// or retry cycle) will still be calculated based on the `weekday_times` schedule.
   pub fn with_initial_run_time(&mut self, run_time: DateTime<Utc>) {
     self.next_run = Some(run_time);
