@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_channel;
+use fibre::mpmc::AsyncSender;
 use chrono::{DateTime, Utc};
 use priority_queue::priority_queue::PriorityQueue;
 use tokio::sync::{mpsc, watch, Mutex, RwLock};
@@ -33,7 +33,7 @@ pub(crate) struct CoordinatorState {
   shutdown_rx: watch::Receiver<Option<ShutdownMode>>,
   worker_outcome_rx: mpsc::Receiver<WorkerOutcome>,
   // Sender
-  job_dispatch_tx: async_channel::Sender<JobDispatchTuple>,
+  job_dispatch_tx: AsyncSender<JobDispatchTuple>,
   // Shared Data Structures (protected by locks)
   job_definitions: Arc<RwLock<HashMap<TKJobId, JobDefinition>>>,
   cancellations: Arc<RwLock<HashSet<TKJobId>>>,
@@ -51,7 +51,7 @@ impl CoordinatorState {
     staging_rx: mpsc::Receiver<(TKJobId, TKJobRequest, Arc<BoxedExecFn>)>,
     cmd_rx: mpsc::Receiver<CoordinatorCommand>,
     shutdown_rx: watch::Receiver<Option<ShutdownMode>>,
-    job_dispatch_tx: async_channel::Sender<JobDispatchTuple>,
+    job_dispatch_tx: AsyncSender<JobDispatchTuple>,
     worker_outcome_rx: mpsc::Receiver<WorkerOutcome>,
     job_definitions: Arc<RwLock<HashMap<TKJobId, JobDefinition>>>,
     cancellations: Arc<RwLock<HashSet<TKJobId>>>,
@@ -817,7 +817,7 @@ impl Coordinator {
     Ok(())
   }
 
-  /// Checks the PQ and dispatches any ready jobs via the async_channel.
+  /// Checks the PQ and dispatches any ready jobs.
   async fn try_dispatch_jobs(&mut self) {
     // Don't dispatch if gracefully shutting down
     if self.shutting_down == Some(ShutdownMode::Graceful) {

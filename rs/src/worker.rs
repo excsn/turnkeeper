@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use async_channel;
+use fibre::mpmc::AsyncReceiver;
 use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, watch, RwLock};
 use tracing::{debug, error, info, trace, warn, Instrument};
@@ -32,7 +32,7 @@ pub(crate) struct Worker {
   // Channel to send job outcome back to Coordinator
   worker_outcome_tx: mpsc::Sender<WorkerOutcome>,
   // Shared channel to receive job assignments
-  job_dispatch_rx: async_channel::Receiver<JobDispatchTuple>,
+  job_dispatch_rx: AsyncReceiver<JobDispatchTuple>,
   // Shared counter for tracking active workers (for graceful shutdown)
   active_workers_counter: Arc<AtomicUsize>,
 }
@@ -46,7 +46,7 @@ impl Worker {
     metrics: SchedulerMetrics,
     shutdown_rx: watch::Receiver<Option<ShutdownMode>>,
     worker_outcome_tx: mpsc::Sender<WorkerOutcome>,
-    job_dispatch_rx: async_channel::Receiver<JobDispatchTuple>,
+    job_dispatch_rx: AsyncReceiver<JobDispatchTuple>,
     active_workers_counter: Arc<AtomicUsize>,
   ) -> Self {
     Self {

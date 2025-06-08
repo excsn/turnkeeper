@@ -15,7 +15,7 @@ use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_channel;
+use fibre::mpmc::{bounded_async};
 use chrono::{DateTime, Utc};
 use futures::future::try_join_all;
 use tokio::runtime::Handle;
@@ -175,10 +175,10 @@ impl SchedulerBuilder {
     let (shutdown_tx, shutdown_rx) = watch::channel::<Option<ShutdownMode>>(None);
 
     let (job_dispatch_tx, job_dispatch_rx) =
-      async_channel::bounded::<(InstanceId, TKJobId)>(self.job_dispatch_buffer_size);
+      bounded_async::<(InstanceId, TKJobId)>(self.job_dispatch_buffer_size);
 
     let (job_dispatch_tx, job_dispatch_rx) =
-      async_channel::bounded::<JobDispatchTuple>(self.job_dispatch_buffer_size);
+      bounded_async::<JobDispatchTuple>(self.job_dispatch_buffer_size);
 
     let (worker_outcome_tx, worker_outcome_rx) =
       mpsc::channel::<crate::command::WorkerOutcome>(self.command_buffer_size);

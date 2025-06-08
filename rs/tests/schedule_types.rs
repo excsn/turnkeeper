@@ -16,6 +16,7 @@ use turnkeeper::{
   QueryError,
 };
 
+#[cfg(feature = "cron_schedule")]
 #[tokio::test]
 async fn test_cron_schedule() {
   setup_tracing();
