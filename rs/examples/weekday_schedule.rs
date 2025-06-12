@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
-use tokio::sync::Mutex;
+use parking_lot::Mutex;
 use tracing::{error, info, warn};
 use turnkeeper::{job::TKJobRequest, scheduler::PriorityQueueType, TurnKeeper};
 use uuid::Uuid;
@@ -60,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   match scheduler.try_add_job(job1_req, job1_fn) {
     Ok(id) => {
       info!("Job 1 submitted with ID: {}", id);
-      job1_ids_clone.lock().await.insert("Job 1".to_string(), id);
+      job1_ids_clone.lock().insert("Job 1".to_string(), id);
     }
     Err(e) => error!("Failed to submit Job 1: {:?}", e),
   }
@@ -80,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   match scheduler.try_add_job(job2_req, job2_fn) {
     Ok(id) => {
       info!("Job 2 submitted with ID: {}", id);
-      job2_ids_clone.lock().await.insert("Job 2".to_string(), id);
+      job2_ids_clone.lock().insert("Job 2".to_string(), id);
     }
     Err(e) => error!("Failed to submit Job 2: {:?}", e),
   }
@@ -90,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   tokio::time::sleep(StdDuration::from_secs(5)).await;
 
   // --- Query Job 1 Status ---
-  let ids = job_ids.lock().await;
+  let ids = job_ids.lock();
   if let Some(job1_id) = ids.get("Job 1") {
     info!("Querying Job 1 ({}) details...", job1_id);
     match scheduler.get_job_details(*job1_id).await {

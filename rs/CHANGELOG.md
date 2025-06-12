@@ -6,7 +6,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Added
-- Synchronous add_job function
 
 ### Changed
 
@@ -18,6 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [1.2.3] - 2025-06-11
+
+### Changed
+- Replaced tokio mutex and rw lock with parking lot.
+- Replaced tokio mpsc with fibre mpsc to fix "blocking send"
+
+## [1.2.2] - 2025-06-08
+
+### Changed
+- Replaced tokio mpmc with fibre mpmc
 
 ## [1.2.1] - 2025-04-30
 

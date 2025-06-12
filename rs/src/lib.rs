@@ -52,7 +52,7 @@
 //!     println!("Scheduler built.");
 //!
 //!     let job_counter = Arc::new(AtomicUsize::new(0));
-//!     let job_id_store = Arc::new(tokio::sync::Mutex::new(None::<Uuid>));
+//!     let job_id_store = Arc::new(parking_lot::Mutex::new(None::<Uuid>));
 //!
 //!     // --- Add a job (Example using WeekdayTimes via helper) ---
 //!     let mut job_req = TKJobRequest::from_week_day(
@@ -109,7 +109,7 @@
 //!     match scheduler.try_add_job(job_req.clone(), exec_fn) { // Clone exec_fn if reused
 //!          Ok(job_id) => {
 //!              println!("Weekday Job submitted successfully with ID: {}", job_id);
-//!              let mut locked_id = id_store_clone.lock().await;
+//!              let mut locked_id = id_store_clone.lock();
 //!              *locked_id = Some(job_id); // Store the ID for later use (cancellation)
 //!          },
 //!          Err(e) => {
@@ -146,7 +146,7 @@
 //!     }
 //!
 //!     // --- Cancel Job (by Lineage ID) ---
-//!     let maybe_job_id = *job_id_store.lock().await;
+//!     let maybe_job_id = *job_id_store.lock();
 //!     if let Some(job_id_to_cancel) = maybe_job_id {
 //!         println!("Requesting cancellation for job {}...", job_id_to_cancel);
 //!         match scheduler.cancel_job(job_id_to_cancel).await {

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use chrono::{Duration as ChronoDuration, Utc};
-use tokio::sync::Mutex;
+use parking_lot::Mutex;
 use turnkeeper::{
   job::TKJobRequest,
   job_context, // Import the macro
@@ -62,12 +62,14 @@ async fn test_job_context_access() {
         assert_eq!(ctx_option.unwrap().instance_id, ctx_macro.instance_id);
 
         // --- Store context from the first run ---
-        let mut locked_capture = capture.lock().await;
-        if locked_capture.is_none() {
-          *locked_capture = Some(ctx_macro); // Store the context
-          tracing::info!("Captured context from first run.");
-        } else {
-          tracing::info!("Context already captured, skipping store.");
+        {
+          let mut locked_capture = capture.lock();
+          if locked_capture.is_none() {
+            *locked_capture = Some(ctx_macro); // Store the context
+            tracing::info!("Captured context from first run.");
+          } else {
+            tracing::info!("Context already captured, skipping store.");
+          }
         }
 
         // Simulate work
@@ -100,7 +102,7 @@ async fn test_job_context_access() {
 
   // --- Verify captured context ---
   tracing::info!("Verifying captured context...");
-  let final_captured_context = captured_context.lock().await;
+  let final_captured_context = captured_context.lock();
 
   match *final_captured_context {
     Some(ctx) => {
@@ -146,7 +148,7 @@ async fn test_job_context_differs_across_runs() {
           ctx.tk_job_id,
           ctx.instance_id
         );
-        captures.lock().await.push(ctx); // Store context from this run
+        captures.lock().push(ctx); // Store context from this run
         tokio::time::sleep(StdDuration::from_millis(50)).await;
         true
       }) as std::pin::Pin<Box<(dyn std::future::Future<Output = bool> + Send + 'static)>>
@@ -170,7 +172,7 @@ async fn test_job_context_differs_across_runs() {
   scheduler.shutdown_graceful(None).await.unwrap();
 
   // --- Verify captured contexts ---
-  let final_contexts = captured_contexts.lock().await;
+  let final_contexts = captured_contexts.lock();
   let run_count = final_contexts.len();
   tracing::info!("TurnKeeper job ran {} times.", run_count);
 

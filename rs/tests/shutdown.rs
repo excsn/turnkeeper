@@ -5,6 +5,7 @@ mod common;
 
 use crate::common::{build_scheduler, setup_tracing};
 use chrono::{Duration as ChronoDuration, Utc};
+use parking_lot::Mutex;
 use std::time::{Duration as StdDuration, Instant};
 use std::{
   future::Future,
@@ -36,7 +37,7 @@ async fn test_graceful_shutdown_waits_for_job() {
         info!("Graceful test job STARTING");
         tokio::time::sleep(StdDuration::from_secs(2)).await; // Long running job
         flag.store(true, Ordering::SeqCst);
-        *finish_time.lock().await = Some(Instant::now()); // Record finish time
+        *finish_time.lock() = Some(Instant::now()); // Record finish time
         info!("Graceful test job FINISHED");
         true // Return bool indicating success
       };
@@ -73,7 +74,7 @@ async fn test_graceful_shutdown_waits_for_job() {
   );
   let finish_time_opt: Option<Instant> = {
     // Create a scope for the guard
-    let guard = job_finish_time.lock().await;
+    let guard = job_finish_time.lock();
     *guard // Dereference the guard to get the Option<Instant> value
            // guard is dropped here at the end of the scope, releasing the lock
   };
@@ -163,5 +164,3 @@ async fn test_force_shutdown_interrupts() {
 }
 
 // TODO: Test graceful shutdown with MORE jobs than workers waiting in queue.
-
-use tokio::sync::Mutex; // Add missing import

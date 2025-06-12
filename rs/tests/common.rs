@@ -4,10 +4,9 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
-use tracing_subscriber::fmt::TestWriter;
 use turnkeeper::{
-  job::{BoxedExecFn, TKJobRequest},
-  scheduler::{PriorityQueueType, SchedulerBuilder},
+  job::BoxedExecFn,
+  scheduler::PriorityQueueType,
   TurnKeeper,
 };
 
@@ -15,9 +14,8 @@ use turnkeeper::{
 pub fn setup_tracing() {
   // Use try_init to avoid panic if called multiple times
   let _ = tracing_subscriber::fmt()
-    .with_max_level(tracing::Level::DEBUG) // Show debug/trace for scheduler internals
-    .with_writer(TestWriter::new()) // Write to test output
     .with_test_writer() // Enable per-test log capture
+    .with_max_level(tracing::Level::DEBUG) // Show debug/trace for scheduler internals
     .try_init();
 }
 

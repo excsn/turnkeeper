@@ -1,7 +1,5 @@
 use crate::command::{ShutdownMode, WorkerOutcome};
-use crate::job::{
-  BoxedExecFn, InstanceId, JobDefinition, TKJobId, TKJobRequest, WorkerId,
-};
+use crate::job::{BoxedExecFn, InstanceId, JobDefinition, TKJobId, TKJobRequest, WorkerId};
 use crate::metrics::SchedulerMetrics;
 
 #[cfg(feature = "job_context")]
@@ -12,9 +10,10 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fibre::mpmc::AsyncReceiver;
 use chrono::{DateTime, Utc};
-use tokio::sync::{mpsc, watch, RwLock};
+use fibre::{mpmc, mpsc};
+use parking_lot::RwLock;
+use tokio::sync::watch;
 use tracing::{debug, error, info, trace, warn, Instrument};
 
 type JobDispatchTuple = (InstanceId, TKJobId, DateTime<Utc>);
@@ -30,9 +29,9 @@ pub(crate) struct Worker {
   metrics: SchedulerMetrics,
   shutdown_rx: watch::Receiver<Option<ShutdownMode>>,
   // Channel to send job outcome back to Coordinator
-  worker_outcome_tx: mpsc::Sender<WorkerOutcome>,
+  worker_outcome_tx: mpsc::BoundedAsyncSender<WorkerOutcome>,
   // Shared channel to receive job assignments
-  job_dispatch_rx: AsyncReceiver<JobDispatchTuple>,
+  job_dispatch_rx: mpmc::AsyncReceiver<JobDispatchTuple>,
   // Shared counter for tracking active workers (for graceful shutdown)
   active_workers_counter: Arc<AtomicUsize>,
 }
@@ -45,8 +44,8 @@ impl Worker {
     job_definitions: Arc<RwLock<HashMap<TKJobId, JobDefinition>>>,
     metrics: SchedulerMetrics,
     shutdown_rx: watch::Receiver<Option<ShutdownMode>>,
-    worker_outcome_tx: mpsc::Sender<WorkerOutcome>,
-    job_dispatch_rx: AsyncReceiver<JobDispatchTuple>,
+    worker_outcome_tx: mpsc::BoundedAsyncSender<WorkerOutcome>,
+    job_dispatch_rx: mpmc::AsyncReceiver<JobDispatchTuple>,
     active_workers_counter: Arc<AtomicUsize>,
   ) -> Self {
     Self {
@@ -175,8 +174,7 @@ impl Worker {
     instance_id: InstanceId,
     lineage_id: TKJobId,
   ) -> Option<(Arc<BoxedExecFn>, TKJobRequest)> {
-    let definitions = self.job_definitions.read().await;
-    if let Some(def) = definitions.get(&lineage_id) {
+    if let Some(def) = self.job_definitions.read().get(&lineage_id) {
       // IMPORTANT CASE
       // ────────────────────────────────────────
       // DROP the strict instance_id == current_instance_id guard.
@@ -184,28 +182,29 @@ impl Worker {
       // ────────────────────────────────────────
 
       // Clone the necessary parts to release the read lock quickly
-      Some((def.exec_fn.clone(), def.request.clone()))
-    } else {
-      warn!(
+      return Some((def.exec_fn.clone(), def.request.clone()));
+    }
+
+    warn!(
+        worker_id = self.id,
+        %lineage_id,
+        %instance_id,
+        "Job definition not found for dispatched job!"
+    );
+    // Send failure outcome
+    let outcome = WorkerOutcome::FetchFailed {
+      instance_id,
+      lineage_id,
+    };
+    if self.worker_outcome_tx.send(outcome).await.is_err() {
+      error!(
           worker_id = self.id,
           %lineage_id,
-          %instance_id,
-          "Job definition not found for dispatched job!"
+          "Failed to send FetchFailed outcome for missing definition."
       );
-      // Send failure outcome
-      let outcome = WorkerOutcome::FetchFailed {
-        instance_id,
-        lineage_id,
-      };
-      if self.worker_outcome_tx.send(outcome).await.is_err() {
-        error!(
-            worker_id = self.id,
-            %lineage_id,
-            "Failed to send FetchFailed outcome for missing definition."
-        );
-      }
-      None
     }
+
+    return None;
   }
 
   /// Executes the job function (handling panics) and then processes the result.
@@ -218,9 +217,7 @@ impl Worker {
     job_start_instant: Instant,
   ) {
     info!("Starting job execution.");
-    let exec_result = self
-      .execute_job_logic(&exec_fn, lineage_id, instance_id)
-      .await;
+    let exec_result = self.execute_job_logic(&exec_fn, lineage_id, instance_id).await;
     let duration = job_start_instant.elapsed();
 
     // Record metrics regardless of outcome
@@ -243,9 +240,7 @@ impl Worker {
       .await;
 
     // Decrement active counter *after* job handling (including sending outcome) is complete
-    let prev_count = self
-      .active_workers_counter
-      .fetch_sub(1, AtomicOrdering::Relaxed);
+    let prev_count = self.active_workers_counter.fetch_sub(1, AtomicOrdering::Relaxed);
     debug!(
       worker_id = self.id,
       prev_active = prev_count - 1,
@@ -285,16 +280,10 @@ impl Worker {
       Ok(job_result_bool) => {
         // Task completed without panic
         if job_result_bool {
-          self
-            .metrics
-            .jobs_executed_success
-            .fetch_add(1, AtomicOrdering::Relaxed);
+          self.metrics.jobs_executed_success.fetch_add(1, AtomicOrdering::Relaxed);
           Ok(true)
         } else {
-          self
-            .metrics
-            .jobs_executed_fail
-            .fetch_add(1, AtomicOrdering::Relaxed);
+          self.metrics.jobs_executed_fail.fetch_add(1, AtomicOrdering::Relaxed);
           Ok(false)
         }
       }
@@ -316,20 +305,14 @@ impl Worker {
             lineage_id, instance_id
           );
 
-          self
-            .metrics
-            .jobs_panicked
-            .fetch_add(1, AtomicOrdering::Relaxed);
+          self.metrics.jobs_panicked.fetch_add(1, AtomicOrdering::Relaxed);
           Err(()) // Indicate panic
         } else {
           // Task was cancelled (e.g., during force shutdown)
           warn!("Job task was cancelled during execution.");
           // Treat cancellation as failure for retry? Or a separate state?
           // Let's treat as failure for now.
-          self
-            .metrics
-            .jobs_executed_fail
-            .fetch_add(1, AtomicOrdering::Relaxed);
+          self.metrics.jobs_executed_fail.fetch_add(1, AtomicOrdering::Relaxed);
           Ok(false) // Or return a different error state?
         }
       }
@@ -343,7 +326,7 @@ impl Worker {
     instance_id: InstanceId, // ID of the instance that just finished
     lineage_id: TKJobId,
     original_request: TKJobRequest, // Base for calculations
-    result: Result<bool, ()>,              // Ok(true)=success, Ok(false)=fail, Err=panic
+    result: Result<bool, ()>,       // Ok(true)=success, Ok(false)=fail, Err=panic
   ) {
     let should_retry = !matches!(result, Ok(true)); // Retry on panic or explicit false
     let current_retry_count = original_request.retry_count;
@@ -358,10 +341,7 @@ impl Worker {
         request_for_calc.retry_count = next_retry_count; // Use next count for backoff calc
         let next_run_time = request_for_calc.calculate_retry_time();
 
-        self
-          .metrics
-          .jobs_retried
-          .fetch_add(1, AtomicOrdering::Relaxed);
+        self.metrics.jobs_retried.fetch_add(1, AtomicOrdering::Relaxed);
         info!(
             worker_id = self.id, %lineage_id, %instance_id,
             retry_attempt = next_retry_count,

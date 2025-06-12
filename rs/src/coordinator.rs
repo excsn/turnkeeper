@@ -1,9 +1,6 @@
 use crate::command::{CoordinatorCommand, JobUpdateData, ShutdownMode, WorkerOutcome};
 use crate::error::QueryError;
-use crate::job::{
-  BoxedExecFn, InstanceId, JobDefinition, JobDetails, JobSummary, MaxRetries, TKJobId,
-  TKJobRequest,
-};
+use crate::job::{BoxedExecFn, InstanceId, JobDefinition, JobDetails, JobSummary, TKJobId, TKJobRequest};
 use crate::metrics::SchedulerMetrics;
 use crate::scheduler::PriorityQueueType;
 
@@ -13,10 +10,11 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use fibre::mpmc::AsyncSender;
 use chrono::{DateTime, Utc};
+use fibre::{mpmc::AsyncSender, mpsc};
+use parking_lot::{Mutex, RwLock};
 use priority_queue::priority_queue::PriorityQueue;
-use tokio::sync::{mpsc, watch, Mutex, RwLock};
+use tokio::sync::watch;
 use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
@@ -24,14 +22,13 @@ use uuid::Uuid;
 type JobDispatchTuple = (InstanceId, TKJobId, DateTime<Utc>);
 
 /// Internal state shared and managed by the Coordinator task.
-#[derive(Debug)] // Avoid Clone if not needed
 pub(crate) struct CoordinatorState {
   pq_type: PriorityQueueType,
   // Receivers
-  staging_rx: mpsc::Receiver<(TKJobId, TKJobRequest, Arc<BoxedExecFn>)>,
-  cmd_rx: mpsc::Receiver<CoordinatorCommand>,
+  staging_rx: mpsc::BoundedAsyncReceiver<(TKJobId, TKJobRequest, Arc<BoxedExecFn>)>,
+  cmd_rx: mpsc::BoundedAsyncReceiver<CoordinatorCommand>,
   shutdown_rx: watch::Receiver<Option<ShutdownMode>>,
-  worker_outcome_rx: mpsc::Receiver<WorkerOutcome>,
+  worker_outcome_rx: mpsc::BoundedAsyncReceiver<WorkerOutcome>,
   // Sender
   job_dispatch_tx: AsyncSender<JobDispatchTuple>,
   // Shared Data Structures (protected by locks)
@@ -48,11 +45,11 @@ impl CoordinatorState {
   #[allow(clippy::too_many_arguments)] // Necessary complexity for Coordinator setup
   pub fn new(
     pq_type: PriorityQueueType,
-    staging_rx: mpsc::Receiver<(TKJobId, TKJobRequest, Arc<BoxedExecFn>)>,
-    cmd_rx: mpsc::Receiver<CoordinatorCommand>,
+    staging_rx: mpsc::BoundedAsyncReceiver<(TKJobId, TKJobRequest, Arc<BoxedExecFn>)>,
+    cmd_rx: mpsc::BoundedAsyncReceiver<CoordinatorCommand>,
     shutdown_rx: watch::Receiver<Option<ShutdownMode>>,
     job_dispatch_tx: AsyncSender<JobDispatchTuple>,
-    worker_outcome_rx: mpsc::Receiver<WorkerOutcome>,
+    worker_outcome_rx: mpsc::BoundedAsyncReceiver<WorkerOutcome>,
     job_definitions: Arc<RwLock<HashMap<TKJobId, JobDefinition>>>,
     cancellations: Arc<RwLock<HashSet<TKJobId>>>,
     instance_to_lineage: Arc<RwLock<HashMap<InstanceId, TKJobId>>>,
@@ -95,8 +92,8 @@ impl PqState {
 
   async fn len(&self) -> usize {
     match self {
-      PqState::Binary(pq) => pq.lock().await.len(),
-      PqState::Handle(pq) => pq.lock().await.len(),
+      PqState::Binary(pq) => pq.lock().len(),
+      PqState::Handle(pq) => pq.lock().len(),
     }
   }
 
@@ -104,8 +101,8 @@ impl PqState {
   /// Returns `(Timestamp, InstanceId)`.
   async fn peek(&self) -> Option<(DateTime<Utc>, InstanceId)> {
     match self {
-      PqState::Binary(pq) => pq.lock().await.peek().map(|(Reverse(dt), id)| (*dt, *id)),
-      PqState::Handle(pq) => pq.lock().await.peek().map(|(id, Reverse(dt))| (*dt, *id)), // Note: Order reversed in peek result
+      PqState::Binary(pq) => pq.lock().peek().map(|(Reverse(dt), id)| (*dt, *id)),
+      PqState::Handle(pq) => pq.lock().peek().map(|(id, Reverse(dt))| (*dt, *id)), // Note: Order reversed in peek result
     }
   }
 
@@ -113,17 +110,17 @@ impl PqState {
   /// Returns `(Timestamp, InstanceId)`.
   async fn pop(&self) -> Option<(DateTime<Utc>, InstanceId)> {
     match self {
-      PqState::Binary(pq) => pq.lock().await.pop().map(|(Reverse(dt), id)| (dt, id)),
-      PqState::Handle(pq) => pq.lock().await.pop().map(|(id, Reverse(dt))| (dt, id)), // Note: Order reversed in pop result
+      PqState::Binary(pq) => pq.lock().pop().map(|(Reverse(dt), id)| (dt, id)),
+      PqState::Handle(pq) => pq.lock().pop().map(|(id, Reverse(dt))| (dt, id)), // Note: Order reversed in pop result
     }
   }
 
   /// Pushes a new job instance onto the priority queue.
   async fn push(&self, instance_id: InstanceId, next_run: DateTime<Utc>) {
     match self {
-      PqState::Binary(pq) => pq.lock().await.push((Reverse(next_run), instance_id)),
+      PqState::Binary(pq) => pq.lock().push((Reverse(next_run), instance_id)),
       PqState::Handle(pq) => {
-        pq.lock().await.push(instance_id, Reverse(next_run));
+        pq.lock().push(instance_id, Reverse(next_run));
       }
     }
   }
@@ -133,7 +130,7 @@ impl PqState {
   async fn remove(&self, instance_id: &InstanceId) -> bool {
     match self {
       PqState::Binary(_) => false, // Cannot remove efficiently
-      PqState::Handle(pq) => pq.lock().await.remove(instance_id).is_some(),
+      PqState::Handle(pq) => pq.lock().remove(instance_id).is_some(),
     }
   }
 }
@@ -172,121 +169,112 @@ impl Coordinator {
 
       // --- Main Event Loop ---
       tokio::select! {
-          biased; // Prioritize checking the shutdown signal
+        biased; // Prioritize checking the shutdown signal
 
-          // --- Shutdown Check ---
-          Ok(()) = self.state.shutdown_rx.changed() => {
-              let shutdown_mode_opt = *self.state.shutdown_rx.borrow();
-              // Process signal only if shutdown state actually changes
-              if shutdown_mode_opt != self.shutting_down {
-                  if shutdown_mode_opt.is_some() {
-                      // Start shutdown process
-                      self.shutting_down = shutdown_mode_opt;
-                      info!(mode=?self.shutting_down.unwrap(), "Coordinator received shutdown signal.");
+        // --- Shutdown Check ---
+        Ok(()) = self.state.shutdown_rx.changed() => {
+          let shutdown_mode_opt = *self.state.shutdown_rx.borrow();
+          // Process signal only if shutdown state actually changes
+          if shutdown_mode_opt != self.shutting_down {
+              if shutdown_mode_opt.is_some() {
+                  // Start shutdown process
+                  self.shutting_down = shutdown_mode_opt;
+                  info!(mode=?self.shutting_down.unwrap(), "Coordinator received shutdown signal.");
 
-                      // Close channels to stop accepting new work and prevent rescheduling loops
-                      self.state.staging_rx.close();
-                      self.state.worker_outcome_rx.close();
-                      // Command channel remains open
+                  // Close channels to stop accepting new work and prevent rescheduling loops
+                  let _ = self.state.staging_rx.close();
 
-                      if self.shutting_down == Some(ShutdownMode::Force) {
-                          info!("Forced shutdown initiated, coordinator loop breaking.");
-                          break; // Exit loop immediately
-                      }
-                      // Continue loop for graceful shutdown handling
-                  } else {
-                      // Signal changed from Some -> None (unexpected)
-                      warn!("Shutdown signal unexpectedly cleared. Resuming normal operation.");
-                      self.shutting_down = None;
-                      // We might need to re-open channels or re-initialize state if this were expected.
+                  if self.shutting_down == Some(ShutdownMode::Force) {
+                      info!("Forced shutdown initiated, coordinator loop breaking.");
+                      break; // Exit loop immediately
                   }
-              }
-          },
-
-          // --- Staging Queue Processing ---
-          // Only process if not gracefully shutting down (or forced)
-          // Use `if self.shutting_down.is_none()` for clarity
-          maybe_job = self.state.staging_rx.recv(), if self.shutting_down.is_none() => {
-              if let Some((lineage_id, request, exec_fn)) = maybe_job {
-                self.handle_new_job(lineage_id, request, exec_fn).await;
+                  // Continue loop for graceful shutdown handling
               } else {
-                  // Staging channel closed, expected during graceful shutdown initiation
-                   trace!("Staging channel closed (expected during shutdown or handle drop).");
+                  // Signal changed from Some -> None (unexpected)
+                  warn!("Shutdown signal unexpectedly cleared. Resuming normal operation.");
+                  self.shutting_down = None;
+                  // We might need to re-open channels or re-initialize state if this were expected.
               }
-          },
-
-          // --- Command Processing ---
-          // Always process commands, even during graceful shutdown
-          maybe_cmd = self.state.cmd_rx.recv() => {
-            if let Some(cmd) = maybe_cmd {
-                self.handle_command(cmd).await;
-            } else {
-                // Command channel closed, likely scheduler handle dropped.
-                if self.shutting_down.is_none() {
-                    warn!("Command channel closed unexpectedly. Initiating graceful shutdown.");
-                    // *** FIX: Set internal state, don't send ***
-                    self.shutting_down = Some(ShutdownMode::Graceful);
-                    // Ensure channels are closed if initiating shutdown here too
-                    self.state.staging_rx.close();
-                    self.state.worker_outcome_rx.close();
-                    // No need to send signal, just update state and let loop handle it.
-                    // The break; below is also wrong - let the main shutdown logic handle exit.
-                    // break; // <-- REMOVE THIS BREAK
-                }
-            }
+          }
         },
 
-          // --- Worker Outcome Processing ---
-          // Process outcomes unless forced shutdown (Graceful needs to update state)
-          maybe_outcome = self.state.worker_outcome_rx.recv(), if self.shutting_down != Some(ShutdownMode::Force) => {
-              if let Some(outcome) = maybe_outcome {
-                  trace!("Received worker outcome: {:?}", outcome);
-                  self.handle_worker_outcome(outcome).await;
-              } else {
-                  // Outcome channel closed, expected during graceful shutdown
-                   if self.shutting_down.is_none() {
-                       error!("Worker outcome channel closed unexpectedly!");
-                       // Consider initiating shutdown here as well?
-                   }
-              }
-          },
+        // --- Staging Queue Processing ---
+        // Only process if not gracefully shutting down (or forced)
+        // Use `if self.shutting_down.is_none()` for clarity
+        maybe_job = self.state.staging_rx.recv(), if self.shutting_down.is_none() => {
+          if let Ok((lineage_id, request, exec_fn)) = maybe_job {
+          self.handle_new_job(lineage_id, request, exec_fn).await;
+          } else {
+            // Staging channel closed, expected during graceful shutdown initiation
+            trace!("Staging channel closed (expected during shutdown or handle drop).");
+          }
+        },
 
-          // --- Timer Wakeup ---
-          // Only sleep if not shutting down forcefully and sleep duration > 0
-          _ = async { sleep(sleep_duration).await }, if self.shutting_down != Some(ShutdownMode::Force) && sleep_duration > Duration::ZERO => {
-              trace!("Timer fired.");
-              // Timer expired, check for ready jobs if not gracefully shutting down
-              if self.shutting_down != Some(ShutdownMode::Graceful) {
-                  self.try_dispatch_jobs().await;
-              }
-              // NOTE: No comma needed before the final `else` branch
-          } // <<-- NO COMMA HERE
+        // --- Command Processing ---
+        // Always process commands, even during graceful shutdown
+        maybe_cmd = self.state.cmd_rx.recv() => {
+          if let Ok(cmd) = maybe_cmd {
+            self.handle_command(cmd).await;
+          } else {
+            // Command channel closed, likely scheduler handle dropped.
+            if self.shutting_down.is_none() {
+              warn!("Command channel closed unexpectedly. Initiating graceful shutdown.");
 
-          // --- Immediate Check or Early Wakeup ---
-          // This `else` branch runs if no other branch was ready immediately on poll.
-          else => {
-              // Check if we should attempt dispatch (not gracefully shutting down)
-              if self.shutting_down != Some(ShutdownMode::Graceful) {
-                  // Woken by state change (clearing timer cache), or sleep duration was zero.
-                  // Check for ready jobs.
-                  trace!("Immediate check / woken early / zero sleep.");
-                  self.try_dispatch_jobs().await;
-              } else {
-                  // If gracefully shutting down, the else branch might still trigger,
-                  // but we don't dispatch. Yield to prevent potential tight loop.
-                   trace!("Immediate check occurred during graceful shutdown - no dispatch.");
-                   tokio::task::yield_now().await;
-              }
-          } // <<-- NO COMMA HERE (last branch)
+              self.shutting_down = Some(ShutdownMode::Graceful);
+              // Ensure channels are closed if initiating shutdown here too
+              let _ = self.state.staging_rx.close();
+              let _ = self.state.worker_outcome_rx.close();
+            }
+          }
+        },
+
+        // --- Worker Outcome Processing ---
+        // Process outcomes unless forced shutdown (Graceful needs to update state)
+        maybe_outcome = self.state.worker_outcome_rx.recv(), if self.shutting_down != Some(ShutdownMode::Force) => {
+          if let Ok(outcome) = maybe_outcome {
+            trace!("Received worker outcome: {:?}", outcome);
+            self.handle_worker_outcome(outcome).await;
+          } else {
+            // Outcome channel closed, expected during graceful shutdown
+            if self.shutting_down.is_none() {
+                error!("Worker outcome channel closed unexpectedly!");
+                // Consider initiating shutdown here as well?
+            }
+          }
+        },
+
+        // --- Timer Wakeup ---
+        // Only sleep if not shutting down forcefully and sleep duration > 0
+        _ = async { sleep(sleep_duration).await }, if self.shutting_down != Some(ShutdownMode::Force) && sleep_duration > Duration::ZERO => {
+          trace!("Timer fired.");
+          // Timer expired, check for ready jobs if not gracefully shutting down
+          if self.shutting_down != Some(ShutdownMode::Graceful) {
+            self.try_dispatch_jobs().await;
+          }
+        }
+
+        // --- Immediate Check or Early Wakeup ---
+        // This `else` branch runs if no other branch was ready immediately on poll.
+        else => {
+          // Check if we should attempt dispatch (not gracefully shutting down)
+          if self.shutting_down != Some(ShutdownMode::Graceful) {
+            // Woken by state change (clearing timer cache), or sleep duration was zero.
+            // Check for ready jobs.
+            trace!("Immediate check / woken early / zero sleep.");
+            self.try_dispatch_jobs().await;
+          } else {
+            // If gracefully shutting down, the else branch might still trigger,
+            // but we don't dispatch. Yield to prevent potential tight loop.
+            trace!("Immediate check occurred during graceful shutdown - no dispatch.");
+            tokio::task::yield_now().await;
+          }
+        }
       } // end select!
 
       // --- Post-Select Shutdown Logic ---
       // Check if graceful shutdown is complete (all workers idle)
       if self.shutting_down == Some(ShutdownMode::Graceful) {
-        let active_count = self
-          .state
-          .active_workers_counter
-          .load(AtomicOrdering::Relaxed);
+        let active_count = self.state.active_workers_counter.load(AtomicOrdering::Relaxed);
         if active_count == 0 {
           info!(
             "Graceful shutdown: All workers idle ({}/{} active). Coordinator exiting.",
@@ -308,7 +296,7 @@ impl Coordinator {
     info!("Coordinator task shutting down.");
     // Close dispatch channel explicitly if not already closed.
     // This signals any remaining waiting workers that no more jobs are coming.
-    self.state.job_dispatch_tx.close();
+    let _ = self.state.job_dispatch_tx.close();
   } // end run()
 
   /// Updates gauge metrics based on current state.
@@ -324,26 +312,14 @@ impl Coordinator {
       .job_staging_buffer_current
       .store(self.state.staging_rx.len(), AtomicOrdering::Relaxed); // Approx available slots
     self.state.metrics.workers_active_current.store(
-      self
-        .state
-        .active_workers_counter
-        .load(AtomicOrdering::Relaxed),
+      self.state.active_workers_counter.load(AtomicOrdering::Relaxed),
       AtomicOrdering::Relaxed,
     );
   }
 
   /// Handles processing a new job request received from the staging channel.
-  async fn handle_new_job(
-    &mut self,
-    lineage_id: TKJobId,
-    mut request: TKJobRequest,
-    exec_fn: Arc<BoxedExecFn>,
-  ) {
-    self
-      .state
-      .metrics
-      .jobs_submitted
-      .fetch_add(1, AtomicOrdering::Relaxed);
+  async fn handle_new_job(&mut self, lineage_id: TKJobId, mut request: TKJobRequest, exec_fn: Arc<BoxedExecFn>) {
+    self.state.metrics.jobs_submitted.fetch_add(1, AtomicOrdering::Relaxed);
     // Use the received lineage_id
     debug!(job_name = %request.name, %lineage_id, "Processing new job from staging using provided ID.");
 
@@ -358,8 +334,8 @@ impl Coordinator {
 
     // Scope for write locks needed for insertion/initial scheduling
     {
-      let mut definitions = self.state.job_definitions.write().await;
-      let mut i_to_l_map = self.state.instance_to_lineage.write().await;
+      let mut definitions = self.state.job_definitions.write();
+      let mut i_to_l_map = self.state.instance_to_lineage.write();
 
       // Determine instance ID only if scheduling needed
       let first_instance_id = request.next_run.map(|_| Uuid::new_v4());
@@ -410,8 +386,8 @@ impl Coordinator {
     match cmd {
       CoordinatorCommand::GetJobDetails { job_id, responder } => {
         // Use read locks
-        let definitions = self.state.job_definitions.read().await;
-        let cancellations = self.state.cancellations.read().await;
+        let definitions = self.state.job_definitions.read();
+        let cancellations = self.state.cancellations.read();
 
         let result = definitions.get(&job_id).map(|def| {
           let is_cancelled = cancellations.contains(&job_id);
@@ -432,8 +408,8 @@ impl Coordinator {
         let _ = responder.send(result.ok_or(QueryError::JobNotFound(job_id)));
       }
       CoordinatorCommand::ListAllJobs { responder } => {
-        let definitions = self.state.job_definitions.read().await;
-        let cancellations = self.state.cancellations.read().await;
+        let definitions = self.state.job_definitions.read();
+        let cancellations = self.state.cancellations.read();
         let summaries = definitions
           .values()
           .map(|def| {
@@ -455,74 +431,56 @@ impl Coordinator {
       }
       CoordinatorCommand::CancelJob { job_id, responder } => {
         // Need write locks to modify state
-        let mut definitions_guard = self.state.job_definitions.write().await;
-        let mut cancellations_guard = self.state.cancellations.write().await;
-        let mut i_to_l_map_guard = self.state.instance_to_lineage.write().await;
 
         let mut should_wake_timer = false; // Flag to wake outside lock scope
         let response: Result<(), QueryError>; // Store the result to send later
+        let mut instance_id_to_remove_opt = None;
+        let mut already_cancelled = true;
 
-        if let Some(def) = definitions_guard.get_mut(&job_id) {
-          let already_cancelled = !cancellations_guard.insert(job_id);
+        if let Some(def) = self.state.job_definitions.write().get_mut(&job_id) {
+          let mut cancellations_guard = self.state.cancellations.write();
+          already_cancelled = !cancellations_guard.insert(job_id);
           if !already_cancelled {
             info!(%job_id, "Marked job lineage as cancelled.");
             // *** Clear next_run when lineage is cancelled ***
             def.request.next_run = None;
             // *** Also clear instance ID immediately ***
-            let instance_id_to_remove_opt = def.current_instance_id.take();
+            instance_id_to_remove_opt = def.current_instance_id.take();
 
             self
               .state
               .metrics
               .jobs_lineage_cancelled
               .fetch_add(1, AtomicOrdering::Relaxed);
-
-            // Drop locks needed only for definition/cancellation modification now
-            drop(definitions_guard);
-            drop(cancellations_guard);
-
-            // Try proactive removal if HandleBased PQ
-            if self.state.pq_type == PriorityQueueType::HandleBased {
-              if let Some(instance_id_to_remove) = instance_id_to_remove_opt {
-                // Remove from instance map under its lock
-                i_to_l_map_guard.remove(&instance_id_to_remove);
-                drop(i_to_l_map_guard); // Drop before await
-
-                if self.pq.remove(&instance_id_to_remove).await {
-                  trace!(%job_id, %instance_id_to_remove, "Proactively removed cancelled instance.");
-                  should_wake_timer = true;
-                } else {
-                  trace!(%job_id, %instance_id_to_remove, "Instance to remove for cancellation not found in PQ.");
-                }
-              } else {
-                // No instance ID was present, just drop lock
-                drop(i_to_l_map_guard);
-              }
-            } else {
-              // Not HandleBased, just drop remaining lock
-              drop(i_to_l_map_guard);
-            }
-
-            response = Ok(());
           } else {
-            // Already cancelled
+            // Already cancelled, Idempotent success
             debug!(%job_id, "Job was already marked as cancelled.");
-            response = Ok(()); // Idempotent success
-                               // Drop locks
-            drop(i_to_l_map_guard);
-            drop(cancellations_guard);
-            drop(definitions_guard);
           }
+
+          response = Ok(());
+          drop(cancellations_guard);
         } else {
           // Job not found
           warn!(%job_id, "Attempted to cancel non-existent job.");
           response = Err(QueryError::JobNotFound(job_id));
-          // Drop locks
-          drop(i_to_l_map_guard);
-          drop(cancellations_guard);
-          drop(definitions_guard);
         }
 
+        if !already_cancelled {
+          // Try proactive removal if HandleBased PQ
+          if self.state.pq_type == PriorityQueueType::HandleBased {
+            if let Some(instance_id_to_remove) = instance_id_to_remove_opt {
+              // Remove from instance map under its lock
+              self.state.instance_to_lineage.write().remove(&instance_id_to_remove);
+
+              if self.pq.remove(&instance_id_to_remove).await {
+                trace!(%job_id, %instance_id_to_remove, "Proactively removed cancelled instance.");
+                should_wake_timer = true;
+              } else {
+                trace!(%job_id, %instance_id_to_remove, "Instance to remove for cancellation not found in PQ.");
+              }
+            }
+          }
+        }
         // Send response *after* all locks are dropped and potential awaits complete
         let _ = responder.send(response);
 
@@ -557,31 +515,36 @@ impl Coordinator {
       } => {
         // 1) Capture the “official” scheduled instance up front
         let scheduled_instance = {
-          let defs = self.state.job_definitions.read().await;
+          let defs = self.state.job_definitions.read();
           defs.get(&lineage_id).and_then(|d| d.current_instance_id)
         };
 
         // 2) Always clean up the completed instance
-        self
-          .cleanup_instance_maps(completed_instance_id, lineage_id)
-          .await;
+        self.cleanup_instance_maps(completed_instance_id, lineage_id).await;
 
         // 3) Now branch:
         if Some(completed_instance_id) == scheduled_instance {
           // — the real scheduled run finished; proceed to schedule the next one as before —
-          let mut definitions = self.state.job_definitions.write().await;
-          let mut i_to_l_map = self.state.instance_to_lineage.write().await;
-          if let Some(def) = definitions.get_mut(&lineage_id) {
-            def.request.retry_count = updated_retry_count;
-            def.request.next_run = Some(next_run_time);
+          let mut new_instance_id_opt = None;
 
-            let new_instance_id = Uuid::new_v4();
-            def.current_instance_id = Some(new_instance_id);
-            i_to_l_map.insert(new_instance_id, lineage_id);
+          {
+            let mut definitions = self.state.job_definitions.write();
+            if let Some(def) = definitions.get_mut(&lineage_id) {
+              def.request.retry_count = updated_retry_count;
+              def.request.next_run = Some(next_run_time);
 
-            drop(i_to_l_map);
-            drop(definitions);
+              let new_instance_id = Uuid::new_v4();
+              new_instance_id_opt = Some(new_instance_id);
+              def.current_instance_id = Some(new_instance_id);
+              self
+                .state
+                .instance_to_lineage
+                .write()
+                .insert(new_instance_id, lineage_id);
+            }
+          }
 
+          if let Some(new_instance_id) = new_instance_id_opt {
             self.pq.push(new_instance_id, next_run_time).await;
             info!("Rescheduled job instance.");
             self.try_wake_timer();
@@ -590,7 +553,7 @@ impl Coordinator {
           // — it was the manual trigger that just ran —
           // Restore the stored scheduled instance so future dispatches see it:
           if let Some(orig_id) = scheduled_instance {
-            let mut definitions = self.state.job_definitions.write().await;
+            let mut definitions = self.state.job_definitions.write();
             if let Some(def) = definitions.get_mut(&lineage_id) {
               def.current_instance_id = Some(orig_id);
             }
@@ -605,12 +568,10 @@ impl Coordinator {
         is_permanent_failure,
       } => {
         info!(%lineage_id, failed = is_permanent_failure, "Job lineage complete (no more runs scheduled).");
-        self
-          .cleanup_instance_maps(completed_instance_id, lineage_id)
-          .await;
+        self.cleanup_instance_maps(completed_instance_id, lineage_id).await;
         // Update state: Clear current instance ID, reset retry count
         {
-          let mut definitions = self.state.job_definitions.write().await;
+          let mut definitions = self.state.job_definitions.write();
           if let Some(def) = definitions.get_mut(&lineage_id) {
             def.current_instance_id = None;
             def.request.next_run = None; // Explicitly mark no next run
@@ -629,10 +590,7 @@ impl Coordinator {
         // Worker couldn't find the job def after being dispatched.
         // Coordinator already incremented active count. Decrement it now.
         error!(%instance_id, %lineage_id, "Worker reported FetchFailed outcome. State potentially inconsistent.");
-        let prev = self
-          .state
-          .active_workers_counter
-          .fetch_sub(1, AtomicOrdering::Relaxed);
+        let prev = self.state.active_workers_counter.fetch_sub(1, AtomicOrdering::Relaxed);
         // Update gauge metric
         self.state.metrics.workers_active_current.store(
           prev.saturating_sub(1), // Use saturating_sub for safety
@@ -644,11 +602,7 @@ impl Coordinator {
   }
 
   /// Handles the logic for the UpdateJob command.
-  async fn handle_update_job(
-    &mut self,
-    job_id: TKJobId,
-    update_data: JobUpdateData,
-  ) -> Result<(), QueryError> {
+  async fn handle_update_job(&mut self, job_id: TKJobId, update_data: JobUpdateData) -> Result<(), QueryError> {
     // 1. Ensure we're using a handle‐based PQ
     if self.state.pq_type != PriorityQueueType::HandleBased {
       warn!(%job_id, "Attempted to update job using BinaryHeap PQ.");
@@ -659,10 +613,8 @@ impl Coordinator {
     let mut needs_reschedule = false;
     let mut old_instance_to_remove: Option<InstanceId> = None;
     {
-      let mut defs = self.state.job_definitions.write().await;
-      let def = defs
-        .get_mut(&job_id)
-        .ok_or(QueryError::JobNotFound(job_id))?;
+      let mut defs = self.state.job_definitions.write();
+      let def = defs.get_mut(&job_id).ok_or(QueryError::JobNotFound(job_id))?;
 
       if let Some(new_schedule) = update_data.schedule {
         if def.request.schedule != new_schedule {
@@ -692,7 +644,7 @@ impl Coordinator {
 
     // CHANGE: Check cancellation before scheduling anything
     let is_cancelled = {
-      let cancels = self.state.cancellations.read().await;
+      let cancels = self.state.cancellations.read();
       cancels.contains(&job_id)
     };
     if is_cancelled {
@@ -704,7 +656,7 @@ impl Coordinator {
     // 4. Remove the old instance from PQ & map
     if let Some(old_id) = old_instance_to_remove {
       {
-        let mut map = self.state.instance_to_lineage.write().await;
+        let mut map = self.state.instance_to_lineage.write();
         map.remove(&old_id);
       }
       if self.pq.remove(&old_id).await {
@@ -715,7 +667,7 @@ impl Coordinator {
     // 5. Compute & enqueue the new instance
     let new_instance_id = Uuid::new_v4();
     let next_run_opt = {
-      let mut defs = self.state.job_definitions.write().await;
+      let mut defs = self.state.job_definitions.write();
       let def = defs.get_mut(&job_id).unwrap(); // safe: we know it exists
       def.request.next_run = def.request.schedule.calculate_next_run(Utc::now());
       def.request.retry_count = 0;
@@ -730,7 +682,7 @@ impl Coordinator {
 
     if let Some(next_run) = next_run_opt {
       {
-        let mut map = self.state.instance_to_lineage.write().await;
+        let mut map = self.state.instance_to_lineage.write();
         map.insert(new_instance_id, job_id);
       }
       self.pq.push(new_instance_id, next_run).await;
@@ -743,69 +695,73 @@ impl Coordinator {
 
   /// Handles the logic for the TriggerJobNow command.
   async fn handle_trigger_job_now(&mut self, job_id: TKJobId) -> Result<(), QueryError> {
-    // ——————————————————————————————————————————————
-    // 1) Read‐lock and existence/cancellation checks (unchanged)
-    let definitions = self.state.job_definitions.read().await;
-    let cancellations = self.state.cancellations.read().await;
+    let (instance_id, trigger_time) = {
+      // ——————————————————————————————————————————————
+      // 1) Read‐lock and existence/cancellation checks (unchanged)
+      let definitions = self.state.job_definitions.read();
+      let cancellations = self.state.cancellations.read();
 
-    if !definitions.contains_key(&job_id) {
-      warn!(%job_id, "Attempted to trigger non-existent job.");
-      drop(cancellations);
-      drop(definitions);
-      return Err(QueryError::JobNotFound(job_id));
-    }
-
-    if cancellations.contains(&job_id) {
-      warn!(%job_id, "Attempted to trigger cancelled job.");
-      drop(cancellations);
-      drop(definitions);
-      return Err(QueryError::TriggerFailedJobCancelled(job_id));
-    }
-    // ——————————————————————————————————————————————
-
-    // ——————————————————————————————————————————————
-    // 2) **ONLY** reject if this is a one-off (`Schedule::Once`) AND it already has an instance
-    let def = definitions.get(&job_id).unwrap();
-    if let crate::job::Schedule::Once(_) = &def.request.schedule {
-      if def.current_instance_id.is_some() {
-        warn!(%job_id, "Attempted to trigger a one-off job already scheduled.");
+      if !definitions.contains_key(&job_id) {
+        warn!(%job_id, "Attempted to trigger non-existent job.");
         drop(cancellations);
         drop(definitions);
-        return Err(QueryError::TriggerFailedJobScheduled(job_id));
+        return Err(QueryError::JobNotFound(job_id));
       }
-    }
-    // For recurring (or `Never`) schedules, we fall through and allow the trigger.
-    // ——————————————————————————————————————————————
 
-    drop(cancellations);
-    drop(definitions);
+      if cancellations.contains(&job_id) {
+        warn!(%job_id, "Attempted to trigger cancelled job.");
+        drop(cancellations);
+        drop(definitions);
+        return Err(QueryError::TriggerFailedJobCancelled(job_id));
+      }
+      // ——————————————————————————————————————————————
 
-    // 3) Create the manual‐trigger instance
-    let instance_id = Uuid::new_v4();
-    let trigger_time = Utc::now();
+      // ——————————————————————————————————————————————
+      // 2) **ONLY** reject if this is a one-off (`Schedule::Once`) AND it already has an instance
+      let def = definitions.get(&job_id).unwrap();
+      if let crate::job::Schedule::Once(_) = &def.request.schedule {
+        if def.current_instance_id.is_some() {
+          warn!(%job_id, "Attempted to trigger a one-off job already scheduled.");
+          drop(cancellations);
+          drop(definitions);
+          return Err(QueryError::TriggerFailedJobScheduled(job_id));
+        }
+      }
+      // For recurring (or `Never`) schedules, we fall through and allow the trigger.
+      // ——————————————————————————————————————————————
 
-    {
-      // Write‐lock: register in instance→lineage map
-      let mut i_to_l_map = self.state.instance_to_lineage.write().await;
-      i_to_l_map.insert(instance_id, job_id);
-    }
+      drop(cancellations);
+      drop(definitions);
 
-    {
-      // Write‐lock: update JobDefinition **only for one-offs**
-      let mut defs = self.state.job_definitions.write().await;
-      if let Some(def_mut) = defs.get_mut(&job_id) {
-        // CHANGE: override for one-offs AND Never
-        match def_mut.request.schedule {
-          crate::job::Schedule::Once(_) | crate::job::Schedule::Never => {
-            def_mut.current_instance_id = Some(instance_id);
-            def_mut.request.retry_count = 0;
-          }
-          _ => {
-            // recurring: leave current_instance_id pointing at the real schedule
+      // 3) Create the manual‐trigger instance
+      let instance_id = Uuid::new_v4();
+      let trigger_time = Utc::now();
+
+      {
+        // Write‐lock: register in instance→lineage map
+        let mut i_to_l_map = self.state.instance_to_lineage.write();
+        i_to_l_map.insert(instance_id, job_id);
+      }
+
+      {
+        // Write‐lock: update JobDefinition **only for one-offs**
+        let mut defs = self.state.job_definitions.write();
+        if let Some(def_mut) = defs.get_mut(&job_id) {
+          // CHANGE: override for one-offs AND Never
+          match def_mut.request.schedule {
+            crate::job::Schedule::Once(_) | crate::job::Schedule::Never => {
+              def_mut.current_instance_id = Some(instance_id);
+              def_mut.request.retry_count = 0;
+            }
+            _ => {
+              // recurring: leave current_instance_id pointing at the real schedule
+            }
           }
         }
       }
-    }
+
+      (instance_id, trigger_time)
+    };
 
     // 4) Enqueue the trigger and immediately dispatch it
     self.pq.push(instance_id, trigger_time).await;
@@ -827,10 +783,7 @@ impl Coordinator {
     let now = Utc::now();
     loop {
       // Check if we have capacity to dispatch (active workers < max_workers)
-      let active_workers = self
-        .state
-        .active_workers_counter
-        .load(AtomicOrdering::Relaxed);
+      let active_workers = self.state.active_workers_counter.load(AtomicOrdering::Relaxed);
       if active_workers >= self.state.max_workers {
         trace!(
           "Dispatch check: All workers busy ({}/{})",
@@ -843,7 +796,7 @@ impl Coordinator {
       // Peek at the next job without removing it yet
       let maybe_next_job = self.pq.peek().await;
 
-      if let Some((next_run_dt, instance_id)) = maybe_next_job {
+      if let Some((next_run_dt, _instance_id)) = maybe_next_job {
         if next_run_dt <= now {
           // Job is ready or overdue. Now try to pop and process.
 
@@ -858,13 +811,13 @@ impl Coordinator {
 
           // Find lineage and check cancellation
           let lineage_id_opt: Option<TKJobId> = {
-            let i_to_l_map = self.state.instance_to_lineage.read().await;
+            let i_to_l_map = self.state.instance_to_lineage.read();
             i_to_l_map.get(&ready_instance_id).copied()
           };
 
           if let Some(lineage_id) = lineage_id_opt {
             let is_cancelled = {
-              let cancellations = self.state.cancellations.read().await;
+              let cancellations = self.state.cancellations.read();
               cancellations.contains(&lineage_id)
             };
 
@@ -882,7 +835,7 @@ impl Coordinator {
 
               // --- Explicitly clear next_run in definition too ---
               {
-                let mut definitions = self.state.job_definitions.write().await;
+                let mut definitions = self.state.job_definitions.write();
                 if let Some(def) = definitions.get_mut(&lineage_id) {
                   def.request.next_run = None;
                   // Also ensure instance ID is cleared if cleanup hasn't run yet
@@ -892,18 +845,13 @@ impl Coordinator {
                 }
               }
               // --- Call map cleanup ---
-              self
-                .cleanup_instance_maps(ready_instance_id, lineage_id)
-                .await; // Cleans up instance map and def.current_instance_id again
+              self.cleanup_instance_maps(ready_instance_id, lineage_id).await; // Cleans up instance map and def.current_instance_id again
               continue; // Check the next job in the PQ
             }
 
             // --- Attempt Dispatch via Channel ---
             // Increment active count *before* sending
-            let prev_active = self
-              .state
-              .active_workers_counter
-              .fetch_add(1, AtomicOrdering::Relaxed);
+            let prev_active = self.state.active_workers_counter.fetch_add(1, AtomicOrdering::Relaxed);
             self
               .state
               .metrics
@@ -927,18 +875,13 @@ impl Coordinator {
                   "Failed to send job dispatch, channel closed? {:?}. Job lost!", e
               );
               // Decrement active count since dispatch failed
-              let prev = self
-                .state
-                .active_workers_counter
-                .fetch_sub(1, AtomicOrdering::Relaxed);
+              let prev = self.state.active_workers_counter.fetch_sub(1, AtomicOrdering::Relaxed);
               self
                 .state
                 .metrics
                 .workers_active_current
                 .store(prev.saturating_sub(1), AtomicOrdering::Relaxed);
-              self
-                .cleanup_instance_maps(ready_instance_id, lineage_id)
-                .await;
+              self.cleanup_instance_maps(ready_instance_id, lineage_id).await;
               break; // Stop dispatching if channel closed
             }
             // Successfully dispatched. Loop to check for more jobs.
@@ -994,10 +937,7 @@ impl Coordinator {
           trace!(next_run = %next_run_dt, sleep_duration = ?final_duration, "Calculated next timer wakeup.");
           return final_duration;
         } else {
-          warn!(
-            ?chrono_duration,
-            "Failed to convert chrono duration. Minimal sleep."
-          );
+          warn!(?chrono_duration, "Failed to convert chrono duration. Minimal sleep.");
           let min_sleep = Duration::from_millis(10);
           self.next_wakeup_timer = Some(tokio::time::Instant::now() + min_sleep);
           return min_sleep;
@@ -1027,12 +967,12 @@ impl Coordinator {
     trace!(%instance_id, %lineage_id, "Cleaning up instance maps.");
     // Remove from instance->lineage map
     {
-      let mut i_to_l_map = self.state.instance_to_lineage.write().await;
+      let mut i_to_l_map = self.state.instance_to_lineage.write();
       i_to_l_map.remove(&instance_id);
     }
     // Clear current_instance_id in JobDefinition if it matches
     {
-      let mut definitions = self.state.job_definitions.write().await;
+      let mut definitions = self.state.job_definitions.write();
       if let Some(def) = definitions.get_mut(&lineage_id) {
         if def.current_instance_id == Some(instance_id) {
           def.current_instance_id = None;
@@ -1047,7 +987,7 @@ impl Coordinator {
     trace!(%instance_id, "Cleaning up orphan instance map entry.");
     // Remove from instance->lineage map just in case it exists there
     {
-      let mut i_to_l_map = self.state.instance_to_lineage.write().await;
+      let mut i_to_l_map = self.state.instance_to_lineage.write();
       i_to_l_map.remove(&instance_id);
     }
     // Cannot efficiently find JobDefinition to clear its state.

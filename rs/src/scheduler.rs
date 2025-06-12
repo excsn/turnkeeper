@@ -15,11 +15,13 @@ use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fibre::mpmc::{bounded_async};
 use chrono::{DateTime, Utc};
+use fibre::oneshot::oneshot;
+use fibre::{mpmc, mpsc, SendError, TrySendError};
 use futures::future::try_join_all;
+use parking_lot::{Mutex, RwLock};
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, oneshot, watch, Mutex, RwLock};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -164,24 +166,21 @@ impl SchedulerBuilder {
     let instance_to_lineage = Arc::new(RwLock::new(HashMap::new()));
     let active_workers_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-    let (staging_tx, staging_rx) = mpsc::channel::<(
+    let (staging_tx, staging_rx) = mpsc::bounded_async::<(
       TKJobId, // Add the ID here
       TKJobRequest,
       Arc<BoxedExecFn>,
     )>(self.staging_buffer_size);
 
-    let (cmd_tx, cmd_rx) = mpsc::channel::<CoordinatorCommand>(self.command_buffer_size);
+    let (cmd_tx, cmd_rx) = mpsc::bounded_async::<CoordinatorCommand>(self.command_buffer_size);
 
     let (shutdown_tx, shutdown_rx) = watch::channel::<Option<ShutdownMode>>(None);
 
     let (job_dispatch_tx, job_dispatch_rx) =
-      bounded_async::<(InstanceId, TKJobId)>(self.job_dispatch_buffer_size);
-
-    let (job_dispatch_tx, job_dispatch_rx) =
-      bounded_async::<JobDispatchTuple>(self.job_dispatch_buffer_size);
+      mpmc::bounded_async::<JobDispatchTuple>(self.job_dispatch_buffer_size);
 
     let (worker_outcome_tx, worker_outcome_rx) =
-      mpsc::channel::<crate::command::WorkerOutcome>(self.command_buffer_size);
+      mpsc::bounded_async::<crate::command::WorkerOutcome>(self.command_buffer_size);
 
     // --- Spawn Coordinator ---
     let coordinator_state = CoordinatorState::new(
@@ -250,12 +249,11 @@ impl SchedulerBuilder {
 /// retries, cancellation, and provides interfaces for querying state and metrics.
 ///
 /// Use [`TurnKeeper::builder()`] to create and configure an instance.
-#[derive(Debug)]
 pub struct TurnKeeper {
   metrics: SchedulerMetrics, // Cloneable struct containing Arcs
   // Channels for interacting with the Coordinator
-  staging_tx: mpsc::Sender<(TKJobId, TKJobRequest, Arc<BoxedExecFn>)>,
-  cmd_tx: mpsc::Sender<CoordinatorCommand>,
+  staging_tx: mpsc::BoundedAsyncSender<(TKJobId, TKJobRequest, Arc<BoxedExecFn>)>,
+  cmd_tx: mpsc::BoundedAsyncSender<CoordinatorCommand>,
   shutdown_tx: watch::Sender<Option<ShutdownMode>>,
   // Task handles for graceful shutdown
   coordinator_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -299,15 +297,17 @@ impl TurnKeeper {
       .staging_submitted_total
       .fetch_add(1, AtomicOrdering::Relaxed);
 
-    let send_payload = (lineage_id, request, boxed_fn);
+    let req = request.clone();
+    let send_payload = (lineage_id, request, boxed_fn.clone());
 
-    match self.staging_tx.blocking_send(send_payload) {
+    match self.staging_tx.clone().to_sync().send(send_payload) {
       // Return the generated ID on success
       Ok(()) => Ok(lineage_id),
-      Err(mpsc::error::SendError((_, req, func))) => {
+      Err(SendError::Closed) => {
         // Return original request/fn tuple in error
-        Err(SubmitError::ChannelClosed((req, func)))
+        Err(SubmitError::ChannelClosed((req, boxed_fn)))
       }
+      Err(SendError::Sent) => unreachable!(),
     }
   }
 
@@ -346,7 +346,7 @@ impl TurnKeeper {
     match self.staging_tx.try_send(send_payload) {
       // Return the generated ID on success
       Ok(()) => Ok(lineage_id),
-      Err(mpsc::error::TrySendError::Full((_, req, func))) => {
+      Err(TrySendError::Full((_, req, func))) => {
         // Destructure to match SubmitError type
         self
           .metrics
@@ -355,10 +355,11 @@ impl TurnKeeper {
         // Return original request/fn tuple in error
         Err(SubmitError::StagingFull((req, func)))
       }
-      Err(mpsc::error::TrySendError::Closed((_, req, func))) => {
+      Err(TrySendError::Closed((_, req, func))) => {
         // Return original request/fn tuple in error
         Err(SubmitError::ChannelClosed((req, func)))
       }
+      Err(TrySendError::Sent(_)) => unreachable!(),
     }
   }
 
@@ -388,7 +389,8 @@ impl TurnKeeper {
       .fetch_add(1, AtomicOrdering::Relaxed);
 
     // *** Send payload including the generated ID ***
-    let send_payload = (lineage_id, request, boxed_fn);
+    let req = request.clone();
+    let send_payload = (lineage_id, request, boxed_fn.clone());
 
     self
       .staging_tx
@@ -396,7 +398,7 @@ impl TurnKeeper {
       .await
       .map(|()| lineage_id) // Return generated ID on successful send
       // Map error to contain original req/fn tuple
-      .map_err(|mpsc::error::SendError((_, req, func))| SubmitError::ChannelClosed((req, func)))
+      .map_err(|_| SubmitError::ChannelClosed((req, boxed_fn)))
   }
 
   /// Retrieves detailed information about a specific job lineage.
@@ -407,14 +409,16 @@ impl TurnKeeper {
   /// - [`QueryError::ResponseFailed`]: Coordinator failed to respond.
   /// - [`QueryError::JobNotFound`]: No job with the given ID exists.
   pub async fn get_job_details(&self, job_id: TKJobId) -> Result<JobDetails, QueryError> {
-    let (responder, response_rx) = oneshot::channel();
+    let (responder, response_rx) = oneshot();
     let cmd = CoordinatorCommand::GetJobDetails { job_id, responder };
+    
     self
       .cmd_tx
       .send(cmd)
       .await
       .map_err(|_| QueryError::SchedulerShutdown)?;
-    response_rx.await.map_err(|_| QueryError::ResponseFailed)? // Unpack inner Result
+
+    response_rx.recv().await.map_err(|_| QueryError::ResponseFailed)? // Unpack inner Result
   }
 
   /// Lists summary information for all known, non-completed job lineages.
@@ -426,14 +430,14 @@ impl TurnKeeper {
   /// - [`QueryError::SchedulerShutdown`]: Scheduler is not running.
   /// - [`QueryError::ResponseFailed`]: Coordinator failed to respond.
   pub async fn list_all_jobs(&self) -> Result<Vec<JobSummary>, QueryError> {
-    let (responder, response_rx) = oneshot::channel();
+    let (responder, response_rx) = oneshot();
     let cmd = CoordinatorCommand::ListAllJobs { responder };
     self
       .cmd_tx
       .send(cmd)
       .await
       .map_err(|_| QueryError::SchedulerShutdown)?;
-    response_rx.await.map_err(|_| QueryError::ResponseFailed)
+    response_rx.recv().await.map_err(|_| QueryError::ResponseFailed)
   }
 
   /// Retrieves a snapshot of the current scheduler metrics.
@@ -443,14 +447,14 @@ impl TurnKeeper {
   /// - [`QueryError::SchedulerShutdown`]: Scheduler is not running.
   /// - [`QueryError::ResponseFailed`]: Coordinator failed to respond.
   pub async fn get_metrics_snapshot(&self) -> Result<MetricsSnapshot, QueryError> {
-    let (responder, response_rx) = oneshot::channel();
+    let (responder, response_rx) = oneshot();
     let cmd = CoordinatorCommand::GetMetricsSnapshot { responder };
     self
       .cmd_tx
       .send(cmd)
       .await
       .map_err(|_| QueryError::SchedulerShutdown)?;
-    response_rx.await.map_err(|_| QueryError::ResponseFailed)
+    response_rx.recv().await.map_err(|_| QueryError::ResponseFailed)
   }
 
   /// Requests cancellation of a job lineage.
@@ -470,14 +474,14 @@ impl TurnKeeper {
   /// - [`QueryError::ResponseFailed`]: Coordinator failed to respond.
   /// - [`QueryError::JobNotFound`]: No job with the given ID exists.
   pub async fn cancel_job(&self, job_id: TKJobId) -> Result<(), QueryError> {
-    let (responder, response_rx) = oneshot::channel();
+    let (responder, response_rx) = oneshot();
     let cmd = CoordinatorCommand::CancelJob { job_id, responder };
     self
       .cmd_tx
       .send(cmd)
       .await
       .map_err(|_| QueryError::SchedulerShutdown)?;
-    response_rx.await.map_err(|_| QueryError::ResponseFailed)? // Unpack inner Result
+    response_rx.recv().await.map_err(|_| QueryError::ResponseFailed)? // Unpack inner Result
   }
 
   /// Updates the configuration of an existing job lineage.
@@ -506,7 +510,7 @@ impl TurnKeeper {
     schedule: Option<Schedule>,
     max_retries: Option<MaxRetries>,
   ) -> Result<(), QueryError> {
-    let (responder, response_rx) = oneshot::channel();
+    let (responder, response_rx) = oneshot();
     let update_data = JobUpdateData {
       schedule,
       max_retries,
@@ -521,7 +525,7 @@ impl TurnKeeper {
       .send(cmd)
       .await
       .map_err(|_| QueryError::SchedulerShutdown)?;
-    response_rx.await.map_err(|_| QueryError::ResponseFailed)? // Unpack inner Result
+    response_rx.recv().await.map_err(|_| QueryError::ResponseFailed)? // Unpack inner Result
   }
 
   /// Manually triggers a job lineage to run as soon as possible.
@@ -545,14 +549,14 @@ impl TurnKeeper {
   /// - [`QueryError::TriggerFailedJobScheduled`]: The job already has an instance scheduled or running.
   /// - [`QueryError::TriggerFailed`]: Internal error during trigger.
   pub async fn trigger_job_now(&self, job_id: TKJobId) -> Result<(), QueryError> {
-    let (responder, response_rx) = oneshot::channel();
+    let (responder, response_rx) = oneshot();
     let cmd = CoordinatorCommand::TriggerJobNow { job_id, responder };
     self
       .cmd_tx
       .send(cmd)
       .await
       .map_err(|_| QueryError::SchedulerShutdown)?;
-    response_rx.await.map_err(|_| QueryError::ResponseFailed)? // Unpack inner Result
+    response_rx.recv().await.map_err(|_| QueryError::ResponseFailed)? // Unpack inner Result
   }
 
   /// Initiates a graceful shutdown.
@@ -608,10 +612,10 @@ impl TurnKeeper {
   /// Helper to wait for task handles during shutdown.
   async fn await_shutdown(&self, timeout_duration: Option<Duration>) -> Result<(), ShutdownError> {
     // Take the handles out of the Mutex to await them.
-    let mut coordinator_handle_opt = self.coordinator_handle.lock().await.take();
+    let mut coordinator_handle_opt = self.coordinator_handle.lock().take();
     let worker_handles = {
       // Limit scope of lock guard
-      let mut guard = self.worker_handles.lock().await;
+      let mut guard = self.worker_handles.lock();
       std::mem::take(&mut *guard) // Empty the vec inside the guard
     }; // Lock released
 

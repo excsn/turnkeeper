@@ -3,7 +3,7 @@ use crate::job::{InstanceId, JobDetails, JobSummary, MaxRetries, TKJobId, Schedu
 use crate::metrics::MetricsSnapshot;
 
 use chrono::{DateTime, Utc};
-use tokio::sync::oneshot;
+use fibre::oneshot;
 
 /// Data required to update a job's configuration.
 /// Fields are optional; `None` indicates no change for that field.

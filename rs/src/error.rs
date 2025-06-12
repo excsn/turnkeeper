@@ -4,7 +4,7 @@ use core::fmt;
 use std::sync::Arc;
 
 use thiserror::Error;
-use tokio::sync::mpsc;
+use fibre::{mpsc, TrySendError, SendError};
 
 /// Errors that can occur during the scheduler building phase using `SchedulerBuilder`.
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
@@ -45,19 +45,13 @@ impl fmt::Debug for SubmitError<(TKJobRequest, Arc<BoxedExecFn>)> {
 // --- Manual From implementations for channel errors ---
 // These allow easily converting errors from tokio::mpsc::[try_]send into SubmitError
 
-impl<T> From<mpsc::error::TrySendError<T>> for SubmitError<T> {
-  fn from(err: mpsc::error::TrySendError<T>) -> Self {
+impl<T> From<TrySendError<T>> for SubmitError<T> {
+  fn from(err: TrySendError<T>) -> Self {
     match err {
-      mpsc::error::TrySendError::Full(job_data) => SubmitError::StagingFull(job_data),
-      mpsc::error::TrySendError::Closed(job_data) => SubmitError::ChannelClosed(job_data),
+      TrySendError::Full(job_data) => SubmitError::StagingFull(job_data),
+      TrySendError::Closed(job_data) => SubmitError::ChannelClosed(job_data),
+      TrySendError::Sent(job_data) => SubmitError::ChannelClosed(job_data)
     }
-  }
-}
-
-impl<T> From<mpsc::error::SendError<T>> for SubmitError<T> {
-  fn from(err: mpsc::error::SendError<T>) -> Self {
-    // When send() fails, it's always because the channel is closed.
-    SubmitError::ChannelClosed(err.0)
   }
 }
 
