@@ -203,7 +203,7 @@ impl Coordinator {
         // Use `if self.shutting_down.is_none()` for clarity
         maybe_job = self.state.staging_rx.recv(), if self.shutting_down.is_none() => {
           if let Ok((lineage_id, request, exec_fn)) = maybe_job {
-          self.handle_new_job(lineage_id, request, exec_fn).await;
+            self.handle_new_job(lineage_id, request, exec_fn).await;
           } else {
             // Staging channel closed, expected during graceful shutdown initiation
             trace!("Staging channel closed (expected during shutdown or handle drop).");
@@ -441,7 +441,7 @@ impl Coordinator {
           let mut cancellations_guard = self.state.cancellations.write();
           already_cancelled = !cancellations_guard.insert(job_id);
           if !already_cancelled {
-            info!(%job_id, "Marked job lineage as cancelled.");
+            trace!(%job_id, "Marked job lineage as cancelled.");
             // *** Clear next_run when lineage is cancelled ***
             def.request.next_run = None;
             // *** Also clear instance ID immediately ***
@@ -510,9 +510,33 @@ impl Coordinator {
       WorkerOutcome::Reschedule {
         lineage_id,
         completed_instance_id,
+        completed_instance_scheduled_time,
         next_run_time,
         updated_retry_count,
       } => {
+        let now = Utc::now();
+        let schedule_lateness = now.signed_duration_since(completed_instance_scheduled_time);
+
+        // We can log this information. Using an `info` level is good for important
+        // state changes, or `debug` if it's too noisy. Let's use `info` for now.
+        // The format will look like:
+        // "Rescheduled job instance. Lateness: 5.123s"
+        // "Rescheduled job instance. On-time by: 50ms" (if it somehow ran early)
+        if schedule_lateness.num_milliseconds() > 0 {
+          debug!(
+              %lineage_id,
+              lateness_ms = schedule_lateness.num_milliseconds(),
+              "Rescheduled job instance. Job was late."
+          );
+        } else {
+          // This case is unlikely but good to handle.
+          debug!(
+              %lineage_id,
+              early_ms = -schedule_lateness.num_milliseconds(),
+              "Rescheduled job instance. Job was on-time or early."
+          );
+        }
+
         // 1) Capture the “official” scheduled instance up front
         let scheduled_instance = {
           let defs = self.state.job_definitions.read();
@@ -546,7 +570,7 @@ impl Coordinator {
 
           if let Some(new_instance_id) = new_instance_id_opt {
             self.pq.push(new_instance_id, next_run_time).await;
-            info!("Rescheduled job instance.");
+            debug!("Rescheduled job instance.");
             self.try_wake_timer();
           }
         } else {
@@ -567,7 +591,7 @@ impl Coordinator {
         completed_instance_id,
         is_permanent_failure,
       } => {
-        info!(%lineage_id, failed = is_permanent_failure, "Job lineage complete (no more runs scheduled).");
+        debug!(%lineage_id, failed = is_permanent_failure, "Job lineage complete (no more runs scheduled).");
         self.cleanup_instance_maps(completed_instance_id, lineage_id).await;
         // Update state: Clear current instance ID, reset retry count
         {
@@ -620,13 +644,13 @@ impl Coordinator {
         if def.request.schedule != new_schedule {
           def.request.schedule = new_schedule.clone();
           needs_reschedule = true;
-          info!(%job_id, "Updated job schedule.");
+          debug!(%job_id, "Updated job schedule.");
         }
       }
       if let Some(new_max) = update_data.max_retries {
         if def.request.max_retries != new_max {
           def.request.max_retries = new_max;
-          info!(%job_id, "Updated job max_retries.");
+          debug!(%job_id, "Updated job max_retries.");
         }
       }
       if needs_reschedule {
@@ -640,7 +664,7 @@ impl Coordinator {
       return Ok(());
     }
 
-    info!(%job_id, "Rescheduling job due to update.");
+    debug!(%job_id, "Rescheduling job due to update.");
 
     // CHANGE: Check cancellation before scheduling anything
     let is_cancelled = {
@@ -649,7 +673,7 @@ impl Coordinator {
     };
     if is_cancelled {
       // Job is cancelled: do NOT enqueue a new instance
-      info!(%job_id, "Job is cancelled—skipping reschedule.");
+      debug!(%job_id, "Job is cancelled—skipping reschedule.");
       return Ok(());
     }
 
@@ -765,7 +789,7 @@ impl Coordinator {
 
     // 4) Enqueue the trigger and immediately dispatch it
     self.pq.push(instance_id, trigger_time).await;
-    info!(%job_id, %instance_id, trigger_time=%trigger_time,
+    debug!(%job_id, %instance_id, trigger_time=%trigger_time,
           "Manually triggered job instance scheduled.");
     self.try_wake_timer();
     self.try_dispatch_jobs().await;
@@ -822,7 +846,7 @@ impl Coordinator {
             };
 
             if is_cancelled {
-              info!(
+              debug!(
                   %lineage_id,
                   %ready_instance_id,
                   "Discarding cancelled job instance popped from PQ."

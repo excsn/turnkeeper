@@ -84,6 +84,9 @@ pub(crate) enum WorkerOutcome {
     lineage_id: TKJobId,
     /// The specific instance ID that just completed execution.
     completed_instance_id: InstanceId,
+    /// The time this completed instance was originally scheduled for.
+    /// This is used as the basis for calculating the next run for fixed-interval schedules.
+    completed_instance_scheduled_time: DateTime<Utc>,
     /// The calculated time for the next run (either regular schedule or retry backoff).
     next_run_time: DateTime<Utc>,
     /// The updated retry count to store for the *next* scheduled run (0 if successful run).

@@ -124,7 +124,7 @@ impl Worker {
                       );
 
                       // Enter the span and execute the job logic
-                      self.execute_and_handle(instance_id, lineage_id, request, exec_fn, start_time)
+                      self.execute_and_handle(instance_id, lineage_id, request, exec_fn, start_time, scheduled_time)
                           .instrument(job_span)
                           .await;
 
@@ -215,6 +215,7 @@ impl Worker {
     request: TKJobRequest,
     exec_fn: Arc<BoxedExecFn>,
     job_start_instant: Instant,
+    scheduled_time: DateTime<Utc>,
   ) {
     info!("Starting job execution.");
     let exec_result = self.execute_job_logic(&exec_fn, lineage_id, instance_id).await;
@@ -236,7 +237,7 @@ impl Worker {
 
     // Process the result and send outcome to coordinator
     self
-      .handle_job_result_outcome(instance_id, lineage_id, request, exec_result)
+      .handle_job_result_outcome(instance_id, lineage_id, request, exec_result, scheduled_time)
       .await;
 
     // Decrement active counter *after* job handling (including sending outcome) is complete
@@ -327,6 +328,7 @@ impl Worker {
     lineage_id: TKJobId,
     original_request: TKJobRequest, // Base for calculations
     result: Result<bool, ()>,       // Ok(true)=success, Ok(false)=fail, Err=panic
+    scheduled_time: DateTime<Utc>,
   ) {
     let should_retry = !matches!(result, Ok(true)); // Retry on panic or explicit false
     let current_retry_count = original_request.retry_count;
@@ -352,6 +354,7 @@ impl Worker {
         outcome = WorkerOutcome::Reschedule {
           lineage_id,
           completed_instance_id: instance_id,
+          completed_instance_scheduled_time: scheduled_time,
           next_run_time,
           updated_retry_count: next_retry_count, // Send the count for the *next* run
         };
@@ -377,6 +380,7 @@ impl Worker {
           outcome = WorkerOutcome::Reschedule {
             lineage_id,
             completed_instance_id: instance_id,
+            completed_instance_scheduled_time: scheduled_time,
             next_run_time,
             updated_retry_count: 0, // Reset count for next regular run
           };
@@ -394,7 +398,7 @@ impl Worker {
       }
     } else {
       // Success
-      let next_regular_run = original_request.calculate_next_run();
+      let next_regular_run = original_request.schedule.calculate_next_run(scheduled_time);
       if let Some(next_run_time) = next_regular_run {
         info!(
             worker_id = self.id, %lineage_id, %instance_id,
@@ -404,6 +408,7 @@ impl Worker {
         outcome = WorkerOutcome::Reschedule {
           lineage_id,
           completed_instance_id: instance_id,
+          completed_instance_scheduled_time: scheduled_time,
           next_run_time,
           updated_retry_count: 0, // Reset count
         };
