@@ -164,6 +164,13 @@ impl Coordinator {
       // Update gauge metrics (approximate for channels)
       self.update_gauge_metrics().await;
 
+      // 1. HIGHEST PRIORITY: Always attempt to dispatch any ready jobs first.
+      //    This ensures that if a worker is free and a job is due, we act on it
+      //    immediately, rather than after a select{} block.
+      if self.shutting_down != Some(ShutdownMode::Graceful) {
+          self.try_dispatch_jobs().await;
+      }
+
       // Calculate sleep duration based on next job time and current time
       let sleep_duration = self.calculate_sleep().await;
 
@@ -250,23 +257,6 @@ impl Coordinator {
           // Timer expired, check for ready jobs if not gracefully shutting down
           if self.shutting_down != Some(ShutdownMode::Graceful) {
             self.try_dispatch_jobs().await;
-          }
-        }
-
-        // --- Immediate Check or Early Wakeup ---
-        // This `else` branch runs if no other branch was ready immediately on poll.
-        else => {
-          // Check if we should attempt dispatch (not gracefully shutting down)
-          if self.shutting_down != Some(ShutdownMode::Graceful) {
-            // Woken by state change (clearing timer cache), or sleep duration was zero.
-            // Check for ready jobs.
-            trace!("Immediate check / woken early / zero sleep.");
-            self.try_dispatch_jobs().await;
-          } else {
-            // If gracefully shutting down, the else branch might still trigger,
-            // but we don't dispatch. Yield to prevent potential tight loop.
-            trace!("Immediate check occurred during graceful shutdown - no dispatch.");
-            tokio::task::yield_now().await;
           }
         }
       } // end select!

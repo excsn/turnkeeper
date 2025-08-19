@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [1.2.5] - 2025-08-18
+
+### Fixed
+- Resolved a critical deadlock in the coordinator that could cause the entire scheduler to stall under high load, especially with recurring jobs that run longer than their interval.
+
 ## [1.2.3] - 2025-06-11
 
 ### Changed
