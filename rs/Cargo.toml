@@ -1,6 +1,6 @@
 [package]
 name = "turnkeeper"
-version = "1.2.5"
+version = "1.2.6"
 edition = "2021"
 description = "An asynchronous, recurring job scheduler for Tokio with support for CRON, interval, and weekday/time schedules, plus retries, cancellation, and observability."
 
