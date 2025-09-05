@@ -1,9 +1,7 @@
 use crate::command::{CoordinatorCommand, JobUpdateData, ShutdownMode};
 use crate::coordinator::{Coordinator, CoordinatorState};
 use crate::error::{BuildError, QueryError, ShutdownError, SubmitError};
-use crate::job::{
-  BoxedExecFn, InstanceId, JobDetails, JobSummary, MaxRetries, TKJobId, TKJobRequest,
-};
+use crate::job::{BoxedExecFn, InstanceId, JobDetails, JobSummary, MaxRetries, TKJobId, TKJobRequest};
 use crate::metrics::{MetricsSnapshot, SchedulerMetrics};
 use crate::worker::Worker;
 use crate::Schedule;
@@ -151,9 +149,7 @@ impl SchedulerBuilder {
   ///
   /// Returns `Err(BuildError::MissingMaxWorkers)` if `max_workers` was not set.
   pub fn build(self) -> Result<TurnKeeper, BuildError> {
-    let max_workers = self
-      .max_workers
-      .ok_or(BuildError::MissingOrZeroMaxWorkers)?;
+    let max_workers = self.max_workers.ok_or(BuildError::MissingOrZeroMaxWorkers)?;
     if max_workers == 0 {
       // Allow building with 0 workers, but log a warning.
       warn!("Scheduler built with 0 workers. No jobs will execute.");
@@ -176,33 +172,12 @@ impl SchedulerBuilder {
 
     let (shutdown_tx, shutdown_rx) = watch::channel::<Option<ShutdownMode>>(None);
 
-    let (job_dispatch_tx, job_dispatch_rx) =
-      mpmc::bounded_async::<JobDispatchTuple>(self.job_dispatch_buffer_size);
+    let (job_dispatch_tx, job_dispatch_rx) = mpmc::bounded_async::<JobDispatchTuple>(self.job_dispatch_buffer_size);
 
     let (worker_outcome_tx, worker_outcome_rx) =
       mpsc::bounded_async::<crate::command::WorkerOutcome>(self.command_buffer_size);
 
-    // --- Spawn Coordinator ---
-    let coordinator_state = CoordinatorState::new(
-      self.pq_type,
-      staging_rx,
-      cmd_rx,
-      shutdown_rx.clone(),
-      job_dispatch_tx,
-      worker_outcome_rx, // Pass receiver to Coordinator
-      job_definitions.clone(),
-      cancellations.clone(),
-      instance_to_lineage.clone(), // Pass instance map
-      metrics.clone(),
-      active_workers_counter.clone(),
-      max_workers,
-    );
-
-    let coordinator_handle = Handle::current().spawn(async move {
-      let mut coordinator = Coordinator::new(coordinator_state);
-      coordinator.run().await;
-      info!("Coordinator task finished.");
-    });
+    let quarantined_jobs = Arc::new(RwLock::new(HashSet::new()));
 
     // --- Spawn Workers ---
     let mut worker_handles = Vec::with_capacity(max_workers);
@@ -212,7 +187,7 @@ impl SchedulerBuilder {
       let worker_shutdown_rx = shutdown_rx.clone();
       let worker_active_counter = active_workers_counter.clone();
       let worker_job_dispatch_rx = job_dispatch_rx.clone();
-      let worker_outcome_tx_clone = worker_outcome_tx.clone(); // Clone sender for worker
+      let worker_outcome_tx_clone = worker_outcome_tx.clone();
 
       let handle = Handle::current().spawn(async move {
         let mut worker = Worker::new(
@@ -229,8 +204,32 @@ impl SchedulerBuilder {
       });
       worker_handles.push(handle);
     }
-    // Drop the original outcome sender, workers hold the clones
-    drop(worker_outcome_tx);
+
+    // --- Spawn Coordinator ---
+    let coordinator_state = CoordinatorState::new(
+      self.pq_type,
+      staging_rx,
+      cmd_rx,
+      shutdown_rx.clone(),
+      job_dispatch_tx,
+      job_dispatch_rx,
+      worker_outcome_tx,
+      worker_outcome_rx,
+      job_definitions.clone(),
+      cancellations.clone(),
+      quarantined_jobs.clone(),
+      instance_to_lineage.clone(),
+      metrics.clone(),
+      active_workers_counter.clone(),
+      max_workers,
+      worker_handles,
+    );
+
+    let coordinator_handle = Handle::current().spawn(async move {
+      let mut coordinator = Coordinator::new(coordinator_state);
+      coordinator.run().await;
+      info!("Coordinator task finished.");
+    });
 
     Ok(TurnKeeper {
       metrics,
@@ -238,7 +237,6 @@ impl SchedulerBuilder {
       cmd_tx,
       shutdown_tx,
       coordinator_handle: Arc::new(Mutex::new(Some(coordinator_handle))),
-      worker_handles: Arc::new(Mutex::new(worker_handles)),
     })
   }
 }
@@ -257,7 +255,6 @@ pub struct TurnKeeper {
   shutdown_tx: watch::Sender<Option<ShutdownMode>>,
   // Task handles for graceful shutdown
   coordinator_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
-  worker_handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl TurnKeeper {
@@ -348,10 +345,7 @@ impl TurnKeeper {
       Ok(()) => Ok(lineage_id),
       Err(TrySendError::Full((_, req, func))) => {
         // Destructure to match SubmitError type
-        self
-          .metrics
-          .staging_rejected_full
-          .fetch_add(1, AtomicOrdering::Relaxed);
+        self.metrics.staging_rejected_full.fetch_add(1, AtomicOrdering::Relaxed);
         // Return original request/fn tuple in error
         Err(SubmitError::StagingFull((req, func)))
       }
@@ -411,12 +405,8 @@ impl TurnKeeper {
   pub async fn get_job_details(&self, job_id: TKJobId) -> Result<JobDetails, QueryError> {
     let (responder, response_rx) = oneshot();
     let cmd = CoordinatorCommand::GetJobDetails { job_id, responder };
-    
-    self
-      .cmd_tx
-      .send(cmd)
-      .await
-      .map_err(|_| QueryError::SchedulerShutdown)?;
+
+    self.cmd_tx.send(cmd).await.map_err(|_| QueryError::SchedulerShutdown)?;
 
     response_rx.recv().await.map_err(|_| QueryError::ResponseFailed)? // Unpack inner Result
   }
@@ -432,11 +422,7 @@ impl TurnKeeper {
   pub async fn list_all_jobs(&self) -> Result<Vec<JobSummary>, QueryError> {
     let (responder, response_rx) = oneshot();
     let cmd = CoordinatorCommand::ListAllJobs { responder };
-    self
-      .cmd_tx
-      .send(cmd)
-      .await
-      .map_err(|_| QueryError::SchedulerShutdown)?;
+    self.cmd_tx.send(cmd).await.map_err(|_| QueryError::SchedulerShutdown)?;
     response_rx.recv().await.map_err(|_| QueryError::ResponseFailed)
   }
 
@@ -449,11 +435,7 @@ impl TurnKeeper {
   pub async fn get_metrics_snapshot(&self) -> Result<MetricsSnapshot, QueryError> {
     let (responder, response_rx) = oneshot();
     let cmd = CoordinatorCommand::GetMetricsSnapshot { responder };
-    self
-      .cmd_tx
-      .send(cmd)
-      .await
-      .map_err(|_| QueryError::SchedulerShutdown)?;
+    self.cmd_tx.send(cmd).await.map_err(|_| QueryError::SchedulerShutdown)?;
     response_rx.recv().await.map_err(|_| QueryError::ResponseFailed)
   }
 
@@ -476,11 +458,7 @@ impl TurnKeeper {
   pub async fn cancel_job(&self, job_id: TKJobId) -> Result<(), QueryError> {
     let (responder, response_rx) = oneshot();
     let cmd = CoordinatorCommand::CancelJob { job_id, responder };
-    self
-      .cmd_tx
-      .send(cmd)
-      .await
-      .map_err(|_| QueryError::SchedulerShutdown)?;
+    self.cmd_tx.send(cmd).await.map_err(|_| QueryError::SchedulerShutdown)?;
     response_rx.recv().await.map_err(|_| QueryError::ResponseFailed)? // Unpack inner Result
   }
 
@@ -511,20 +489,13 @@ impl TurnKeeper {
     max_retries: Option<MaxRetries>,
   ) -> Result<(), QueryError> {
     let (responder, response_rx) = oneshot();
-    let update_data = JobUpdateData {
-      schedule,
-      max_retries,
-    };
+    let update_data = JobUpdateData { schedule, max_retries };
     let cmd = CoordinatorCommand::UpdateJob {
       job_id,
       update_data,
       responder,
     };
-    self
-      .cmd_tx
-      .send(cmd)
-      .await
-      .map_err(|_| QueryError::SchedulerShutdown)?;
+    self.cmd_tx.send(cmd).await.map_err(|_| QueryError::SchedulerShutdown)?;
     response_rx.recv().await.map_err(|_| QueryError::ResponseFailed)? // Unpack inner Result
   }
 
@@ -551,11 +522,7 @@ impl TurnKeeper {
   pub async fn trigger_job_now(&self, job_id: TKJobId) -> Result<(), QueryError> {
     let (responder, response_rx) = oneshot();
     let cmd = CoordinatorCommand::TriggerJobNow { job_id, responder };
-    self
-      .cmd_tx
-      .send(cmd)
-      .await
-      .map_err(|_| QueryError::SchedulerShutdown)?;
+    self.cmd_tx.send(cmd).await.map_err(|_| QueryError::SchedulerShutdown)?;
     response_rx.recv().await.map_err(|_| QueryError::ResponseFailed)? // Unpack inner Result
   }
 
@@ -611,102 +578,41 @@ impl TurnKeeper {
 
   /// Helper to wait for task handles during shutdown.
   async fn await_shutdown(&self, timeout_duration: Option<Duration>) -> Result<(), ShutdownError> {
-    // Take the handles out of the Mutex to await them.
-    let mut coordinator_handle_opt = self.coordinator_handle.lock().take();
-    let worker_handles = {
-      // Limit scope of lock guard
-      let mut guard = self.worker_handles.lock();
-      std::mem::take(&mut *guard) // Empty the vec inside the guard
-    }; // Lock released
-
-    let mut tasks = Vec::with_capacity(1 + worker_handles.len());
-    if let Some(coord_handle) = coordinator_handle_opt.take() {
-      tasks.push(tokio::spawn(async move {
-        match coord_handle.await {
-          Ok(()) => {
-            info!("Coordinator task joined.");
-            Ok(())
-          }
-          Err(e) => {
-            error!("Coordinator task panicked: {:?}", e);
-            Err(ShutdownError::TaskPanic)
-          }
+    // Take the coordinator handle. We will wait for it to finish.
+    // The coordinator is now responsible for joining its worker handles.
+    let coordinator_handle = match self.coordinator_handle.lock().take() {
+        Some(handle) => handle,
+        None => {
+            warn!("Shutdown called, but coordinator handle was already taken (already shut down?).");
+            return Err(ShutdownError::AlreadyShuttingDown);
         }
-      }));
-    } else {
-      warn!("Coordinator handle missing during shutdown wait.");
-    }
-
-    for (i, handle) in worker_handles.into_iter().enumerate() {
-      tasks.push(tokio::spawn(async move {
-        match handle.await {
-          Ok(()) => {
-            /* debug!(worker_id = i, "Worker task joined."); */
-            Ok(())
-          } // Reduce log noise
-          Err(e) => {
-            error!(worker_id = i, "Worker task panicked: {:?}", e);
-            Err(ShutdownError::TaskPanic)
-          }
-        }
-      }));
-    }
-
-    if tasks.is_empty() {
-      warn!("No tasks found to await during shutdown.");
-      return Ok(());
-    }
-
-    let join_all_fut = try_join_all(tasks); // Use try_join_all
-
-    let result = if let Some(timeout) = timeout_duration {
-      match tokio::time::timeout(timeout, join_all_fut).await {
-        Ok(Ok(results)) => {
-          // Timeout ok, try_join_all ok
-          let _ = results; // Discard the Vec<Result<()>> from spawn
-          Ok(())
-        }
-        Ok(Err(join_err)) => {
-          // Timeout ok, try_join_all returned task panic Err
-          error!("A task panicked during shutdown: {:?}", join_err);
-          // Extract the original ShutdownError from the JoinError if possible,
-          // otherwise return a generic panic error.
-          // JoinError contains the panic payload. We wrapped our errors in Result.
-          // This part is tricky, let's just return WorkerPanic for now.
-          Err(ShutdownError::TaskPanic)
-        }
-        Err(_) => {
-          // Timeout elapsed
-          error!("Shutdown timed out after {:?}", timeout);
-          Err(ShutdownError::Timeout)
-        }
-      }
-    } else {
-      // No timeout
-      match join_all_fut.await {
-        Ok(results) => {
-          let _ = results;
-          Ok(())
-        }
-        Err(join_err) => {
-          error!(
-            "A task panicked during shutdown (no timeout): {:?}",
-            join_err
-          );
-          Err(ShutdownError::TaskPanic)
-        }
-      }
     };
 
-    if result.is_ok() {
-      info!("All tasks joined successfully.");
+    let join_fut = async {
+        match coordinator_handle.await {
+            Ok(()) => {
+                info!("Coordinator task joined successfully.");
+                Ok(())
+            }
+            Err(e) => {
+                error!("Coordinator task panicked during shutdown: {:?}", e);
+                Err(ShutdownError::TaskPanic)
+            }
+        }
+    };
+
+    if let Some(timeout) = timeout_duration {
+        match tokio::time::timeout(timeout, join_fut).await {
+            Ok(Ok(())) => Ok(()), // Timeout ok, join_fut ok
+            Ok(Err(e)) => Err(e),  // Timeout ok, join_fut returned an error
+            Err(_) => {
+                error!("Shutdown timed out waiting for the coordinator after {:?}", timeout);
+                Err(ShutdownError::Timeout)
+            }
+        }
     } else {
-      error!("Error during shutdown task joining: {:?}", result);
+        // No timeout, just wait forever.
+        join_fut.await
     }
-    result
   }
 }
-
-// Note: Drop implementation is complex due to async context and potential blocking.
-// Explicit shutdown is strongly recommended.
-// impl Drop for TurnKeeper { ... }

@@ -6,12 +6,14 @@ use crate::metrics::SchedulerMetrics;
 use crate::job::context::{JobContext, CURRENT_JOB_CONTEXT};
 
 use std::collections::HashMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use fibre::{mpmc, mpsc};
+use futures::FutureExt;
 use parking_lot::RwLock;
 use tokio::sync::watch;
 use tracing::{debug, error, info, trace, warn, Instrument};
@@ -85,76 +87,70 @@ impl Worker {
 
           // --- Wait for Job Dispatch ---
           result = self.job_dispatch_rx.recv() => {
-               match result {
-                Ok((instance_id, lineage_id, scheduled_time)) => {
-                  debug!(worker_id=self.id, %instance_id, %lineage_id, %scheduled_time, "Received job dispatch.");
+            match result {
+              Ok((instance_id, lineage_id, scheduled_time)) => {
+                debug!(worker_id=self.id, %instance_id, %lineage_id, %scheduled_time, "Received job dispatch.");
 
-                  // --- Calculate and Record Wait Time ---
-                  let start_time = Instant::now(); // Time execution *actually* starts
-                  let now_utc = Utc::now();
-                  if now_utc >= scheduled_time {
-                      let wait_duration = now_utc.signed_duration_since(scheduled_time);
-                      match wait_duration.to_std() {
-                          Ok(std_wait_duration) => {
-                              self.metrics.job_queue_wait_duration.record(std_wait_duration);
-                              trace!(worker_id=self.id, %instance_id, wait_ms = std_wait_duration.as_millis(), "Recorded queue wait time.");
-                          }
-                          Err(e) => {
-                              warn!(worker_id=self.id, %instance_id, %scheduled_time, error=%e, "Failed to convert wait duration");
-                          }
-                      }
-                  } else {
-                      // Should not happen if coordinator logic is correct, but log if it does
-                      warn!(worker_id=self.id, %instance_id, %scheduled_time, "Job started *before* its scheduled time?");
-                      self.metrics.job_queue_wait_duration.record(Duration::ZERO); // Record zero wait
-                  }
-                  // --- Fetch Job Details ---
-                  // This lock should be brief
-                  let maybe_job_info = self.fetch_job_details(instance_id, lineage_id).await;
-
-                  if let Some((exec_fn, request)) = maybe_job_info {
-                      // Create a tracing span for the job execution context
-                      let job_span = tracing::span!(
-                          tracing::Level::INFO, // Or DEBUG
-                          "job_exec",
-                          worker_id = self.id,
-                          %lineage_id,
-                          %instance_id,
-                          job_name = request.name.as_str()
-                      );
-
-                      // Enter the span and execute the job logic
-                      self.execute_and_handle(instance_id, lineage_id, request, exec_fn, start_time, scheduled_time)
-                          .instrument(job_span)
-                          .await;
-
-                  } else {
-                      // Fetch failed, worker_outcome_tx was already notified in fetch_job_details
-                      // The active count was incremented by coordinator but worker failed early.
-                      // Need coordinator to handle FetchFailed outcome to decrement count.
-                      error!(worker_id=self.id, %instance_id, %lineage_id, "Discarding dispatch due to fetch failure.");
-
-                      let prev_count = self.active_workers_counter.fetch_sub(1, AtomicOrdering::Relaxed);
-                      self.metrics.workers_active_current.store(
-                          prev_count.saturating_sub(1),
-                          AtomicOrdering::Relaxed,
-                      );
-                      debug!(worker_id = self.id, %instance_id, "Decremented active count after fetch failure.");
-                  }
-                  // Loop immediately after handling (or failing to fetch) to wait for the next job
-                },
-                Err(e) => {
-                // Channel closed - Coordinator likely terminated
-                if !self.is_shutting_down() {
-                    error!(worker_id=self.id, "Job dispatch channel closed unexpectedly. Worker exiting. Error: {:?}", e);
+                // --- Calculate and Record Wait Time ---
+                let start_time = Instant::now(); // Time execution *actually* starts
+                let now_utc = Utc::now();
+                if now_utc >= scheduled_time {
+                    let wait_duration = now_utc.signed_duration_since(scheduled_time);
+                    match wait_duration.to_std() {
+                        Ok(std_wait_duration) => {
+                            self.metrics.job_queue_wait_duration.record(std_wait_duration);
+                            trace!(worker_id=self.id, %instance_id, wait_ms = std_wait_duration.as_millis(), "Recorded queue wait time.");
+                        }
+                        Err(e) => {
+                            warn!(worker_id=self.id, %instance_id, %scheduled_time, error=%e, "Failed to convert wait duration");
+                        }
+                    }
                 } else {
-                    // Expected during shutdown
-                    info!(worker_id=self.id, "Job dispatch channel closed during shutdown. Worker exiting.");
+                    // Should not happen if coordinator logic is correct, but log if it does
+                    warn!(worker_id=self.id, %instance_id, %scheduled_time, "Job started *before* its scheduled time?");
+                    self.metrics.job_queue_wait_duration.record(Duration::ZERO); // Record zero wait
                 }
-                break; // Exit loop
+                // --- Fetch Job Details ---
+                // This lock should be brief
+                let maybe_job_info = self.fetch_job_details(instance_id, lineage_id).await;
+
+                if let Some((exec_fn, request)) = maybe_job_info {
+                  // Create a tracing span for the job execution context
+                  let job_span = tracing::span!(
+                    tracing::Level::INFO, // Or DEBUG
+                    "job_exec",
+                    worker_id = self.id,
+                    %lineage_id,
+                    %instance_id,
+                    job_name = request.name.as_str()
+                  );
+
+                  // Enter the span and execute the job logic
+                  self
+                    .execute_and_handle(instance_id, lineage_id, request, exec_fn, start_time, scheduled_time)
+                    .instrument(job_span)
+                    .await;
+
+                } else {
+                  // Fetch failed, worker_outcome_tx was already notified in fetch_job_details
+                  // The active count was incremented by coordinator but worker failed early.
+                  // Need coordinator to handle FetchFailed outcome to decrement count.
+                  error!(worker_id=self.id, %instance_id, %lineage_id, "Discarding dispatch due to fetch failure.");
+                }
+                // Loop immediately after handling (or failing to fetch) to wait for the next job
+              },
+              Err(e) => {
+              // Channel closed - Coordinator likely terminated
+              if !self.is_shutting_down() {
+                  error!(worker_id=self.id, "Job dispatch channel closed unexpectedly. Worker exiting. Error: {:?}", e);
+              } else {
+                  // Expected during shutdown
+                  info!(worker_id=self.id, "Job dispatch channel closed during shutdown. Worker exiting.");
               }
-            } // end match result
-          } // end select branch job_dispatch_rx
+              break; // Exit loop
+            }
+          } // end match result
+        } // end select branch job_dispatch_rx
 
       } // end select!
     } // end loop
@@ -217,41 +213,90 @@ impl Worker {
     job_start_instant: Instant,
     scheduled_time: DateTime<Utc>,
   ) {
-    info!("Starting job execution.");
-    let exec_result = self.execute_job_logic(&exec_fn, lineage_id, instance_id).await;
-    let duration = job_start_instant.elapsed();
+    let execution_future = async move {
+      info!("Starting job execution.");
+      let exec_result = self.execute_job_logic(&exec_fn, lineage_id, instance_id).await;
+      let duration = job_start_instant.elapsed();
 
-    // Record metrics regardless of outcome
-    self.metrics.job_execution_duration.record(duration);
+      self.metrics.job_execution_duration.record(duration);
 
-    let success_str = match exec_result {
-      Ok(true) => "Success",
-      Ok(false) => "Fail",
-      Err(()) => "Panic",
+      let success_str = match exec_result {
+        Ok(true) => "Success",
+        Ok(false) => "Fail",
+        Err(()) => "Panic",
+      };
+      info!(
+        duration_ms = duration.as_millis(),
+        outcome = success_str,
+        "Finished job execution."
+      );
+
+      self
+        .handle_job_result_outcome(instance_id, lineage_id, request, exec_result, scheduled_time)
+        .await;
     };
-    info!(
-      duration_ms = duration.as_millis(),
-      outcome = success_str,
-      "Finished job execution."
-    );
 
-    // Process the result and send outcome to coordinator
-    self
-      .handle_job_result_outcome(instance_id, lineage_id, request, exec_result, scheduled_time)
-      .await;
+    // We wrap the future in `AssertUnwindSafe`. This tells the compiler that we are
+    // confident that catching a panic from this future will not leave our program
+    // in an unsound state. We then call `.catch_unwind()` on the wrapper.
+    let result = AssertUnwindSafe(execution_future).catch_unwind().await;
 
-    // Decrement active counter *after* job handling (including sending outcome) is complete
-    let prev_count = self.active_workers_counter.fetch_sub(1, AtomicOrdering::Relaxed);
-    debug!(
-      worker_id = self.id,
-      prev_active = prev_count - 1,
-      "Decremented active worker count."
-    );
-    // Update gauge metric
-    self.metrics.workers_active_current.store(
-      prev_count - 1, // Store the value *after* decrementing
-      AtomicOrdering::Relaxed,
-    );
+    match result {
+      Ok(_) => {
+        // The future completed without panicking. This path is already correct.
+        // The job is finished, so we can decrement the counter.
+        let prev_count = self.active_workers_counter.fetch_sub(1, AtomicOrdering::Relaxed);
+        debug!(
+          worker_id = self.id,
+          prev_active = prev_count.saturating_sub(1),
+          "Decremented active worker count."
+        );
+        self
+          .metrics
+          .workers_active_current
+          .store(prev_count.saturating_sub(1), AtomicOrdering::Relaxed);
+        // The function now implicitly returns () here.
+      }
+      Err(panic_payload) => {
+        // A panic was caught! The worker should now recover.
+        let panic_info = panic_payload
+          .downcast_ref::<&'static str>()
+          .map(|s| *s)
+          .or_else(|| panic_payload.downcast_ref::<String>().map(|s| s.as_str()))
+          .unwrap_or("Unknown panic payload")
+          .to_string();
+
+        error!(%lineage_id, %instance_id, %panic_info, "Worker caught a panic during job execution; recovering.");
+
+        self.metrics.jobs_panicked.fetch_add(1, AtomicOrdering::Relaxed);
+
+        // 1. Report the panic to the coordinator.
+        let outcome = WorkerOutcome::Panic {
+          lineage_id,
+          completed_instance_id: instance_id,
+          panic_info,
+        };
+
+        if self.worker_outcome_tx.send(outcome).await.is_err() {
+          error!(%lineage_id, "Failed to send Panic outcome to coordinator (scheduler likely shutdown).");
+        }
+
+        // 2. CRITICAL: Decrement the active worker count, as the worker is no longer busy.
+        // This mirrors the logic in the Ok(_) branch.
+        let prev_count = self.active_workers_counter.fetch_sub(1, AtomicOrdering::Relaxed);
+        debug!(
+          worker_id = self.id,
+          prev_active = prev_count.saturating_sub(1),
+          "Decremented active worker count after catching panic."
+        );
+        self
+          .metrics
+          .workers_active_current
+          .store(prev_count.saturating_sub(1), AtomicOrdering::Relaxed);
+
+        // 3. The worker does NOT terminate. It will loop back to wait for a new job.
+      }
+    }
   }
 
   /// Executes the job function, catching panics.
@@ -265,58 +310,27 @@ impl Worker {
     let func = exec_fn.clone();
     let future_to_run = func(); // Get the Future from the Fn
 
-    // --- Spawn with or without context scope ---
+    // --- NEW LOGIC: Await the future directly within the context. ---
+    // If the future panics, the .await will propagate the panic,
+    // which will then be caught by the `catch_unwind` in `execute_and_handle`.
     #[cfg(feature = "job_context")]
-    let task = {
+    let job_result_bool = {
       let context = JobContext {
         tk_job_id: lineage_id,
         instance_id,
       };
-      tokio::spawn(CURRENT_JOB_CONTEXT.scope(context, future_to_run))
+      CURRENT_JOB_CONTEXT.scope(context, future_to_run).await
     };
     #[cfg(not(feature = "job_context"))]
-    let task = tokio::spawn(future_to_run);
+    let job_result_bool = future_to_run.await;
 
-    match task.await {
-      Ok(job_result_bool) => {
-        // Task completed without panic
-        if job_result_bool {
-          self.metrics.jobs_executed_success.fetch_add(1, AtomicOrdering::Relaxed);
-          Ok(true)
-        } else {
-          self.metrics.jobs_executed_fail.fetch_add(1, AtomicOrdering::Relaxed);
-          Ok(false)
-        }
-      }
-      Err(join_error) => {
-        // Task panicked or was cancelled
-        if join_error.is_panic() {
-          // Log context only if feature is enabled and it panicked
-          #[cfg(feature = "job_context")]
-          error!(
-            "Job function panicked! Context: {:?}",
-            JobContext {
-              tk_job_id: lineage_id,
-              instance_id
-            }
-          );
-          #[cfg(not(feature = "job_context"))]
-          error!(
-            "Job function panicked! IDs: Job {}, Instance {}",
-            lineage_id, instance_id
-          );
-
-          self.metrics.jobs_panicked.fetch_add(1, AtomicOrdering::Relaxed);
-          Err(()) // Indicate panic
-        } else {
-          // Task was cancelled (e.g., during force shutdown)
-          warn!("Job task was cancelled during execution.");
-          // Treat cancellation as failure for retry? Or a separate state?
-          // Let's treat as failure for now.
-          self.metrics.jobs_executed_fail.fetch_add(1, AtomicOrdering::Relaxed);
-          Ok(false) // Or return a different error state?
-        }
-      }
+    // The task completed without panic.
+    if job_result_bool {
+      self.metrics.jobs_executed_success.fetch_add(1, AtomicOrdering::Relaxed);
+      Ok(true)
+    } else {
+      self.metrics.jobs_executed_fail.fetch_add(1, AtomicOrdering::Relaxed);
+      Ok(false)
     }
   }
 

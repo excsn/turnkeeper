@@ -1,9 +1,10 @@
 use crate::error::QueryError;
-use crate::job::{InstanceId, JobDetails, JobSummary, MaxRetries, TKJobId, Schedule};
+use crate::job::{InstanceId, JobDetails, JobSummary, MaxRetries, Schedule, TKJobId};
 use crate::metrics::MetricsSnapshot;
 
 use chrono::{DateTime, Utc};
 use fibre::oneshot;
+use tokio::task::JoinHandle;
 
 /// Data required to update a job's configuration.
 /// Fields are optional; `None` indicates no change for that field.
@@ -56,8 +57,8 @@ pub(crate) enum CoordinatorCommand {
   },
   /// Manually trigger a job to run now (if possible).
   TriggerJobNow {
-      job_id: TKJobId,
-      responder: oneshot::Sender<Result<(), QueryError>>, // Ok if scheduled, Err if not found/running etc.
+    job_id: TKJobId,
+    responder: oneshot::Sender<Result<(), QueryError>>, // Ok if scheduled, Err if not found/running etc.
   },
 }
 
@@ -109,5 +110,15 @@ pub(crate) enum WorkerOutcome {
     instance_id: InstanceId,
     /// The lineage ID the worker was attempting to fetch.
     lineage_id: TKJobId,
+  },
+  /// A job's execution (or the worker's own logic) panicked.
+  /// The worker is now terminating and needs to be replaced.
+  Panic {
+    /// The lineage ID of the job that was running during the panic.
+    lineage_id: TKJobId,
+    /// The specific instance ID that was running.
+    completed_instance_id: InstanceId,
+    /// Information about the panic, captured as a string.
+    panic_info: String,
   },
 }

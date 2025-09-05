@@ -1,4 +1,3 @@
-//! tests/retry_panic.rs
 //! Tests for retry logic and panic handling - focuses on scheduling, not execution of retries.
 
 mod common;
@@ -140,46 +139,6 @@ async fn test_permanent_failure_scheduling() {
 
   // Let's check that permanent failure count is still 0 after only one run
   assert_eq!(metrics1.jobs_permanently_failed, 0);
-
-  scheduler.shutdown_graceful(None).await.unwrap();
-}
-
-#[tokio::test]
-async fn test_panic_retry_scheduling() {
-  setup_tracing();
-  let scheduler = build_scheduler(1, PriorityQueueType::HandleBased).unwrap();
-  let max_retries = 1;
-
-  // Use `never` schedule, rely on initial run time
-  let mut req = TKJobRequest::never("Panic Schedule Test", max_retries);
-  let initial_run_time = Utc::now() + ChronoDuration::milliseconds(50);
-  req.with_initial_run_time(initial_run_time);
-
-  let job_id = scheduler
-    .add_job_async(req, job_exec_panic())
-    .await
-    .expect("Add job failed");
-
-  // --- Verify First Panic and Retry Schedule ---
-  tokio::time::sleep(StdDuration::from_millis(200)).await; // Wait for first run/panic
-  let metrics1 = scheduler.get_metrics_snapshot().await.unwrap();
-  let details1 = scheduler.get_job_details(job_id).await.unwrap();
-
-  assert_eq!(metrics1.jobs_panicked, 1, "Should have panicked once");
-  assert_eq!(
-    metrics1.jobs_retried, 1,
-    "Should schedule 1 retry after panic"
-  );
-  assert_eq!(
-    details1.retry_count, 1,
-    "Retry count should be 1 for next run"
-  );
-  assert!(
-    details1.next_run_time.is_some(),
-    "Should have retry scheduled"
-  );
-  assert!(details1.next_run_time.unwrap() > initial_run_time + ChronoDuration::seconds(50)); // Basic backoff check
-  assert_eq!(metrics1.jobs_permanently_failed, 0); // Not permanently failed yet
 
   scheduler.shutdown_graceful(None).await.unwrap();
 }

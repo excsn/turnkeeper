@@ -3,6 +3,7 @@ use crate::error::QueryError;
 use crate::job::{BoxedExecFn, InstanceId, JobDefinition, JobDetails, JobSummary, TKJobId, TKJobRequest};
 use crate::metrics::SchedulerMetrics;
 use crate::scheduler::PriorityQueueType;
+use crate::worker::Worker;
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -11,10 +12,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use fibre::mpmc;
 use fibre::{mpmc::AsyncSender, mpsc};
+use futures::future::select_all;
 use parking_lot::{Mutex, RwLock};
 use priority_queue::priority_queue::PriorityQueue;
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
@@ -28,17 +32,21 @@ pub(crate) struct CoordinatorState {
   staging_rx: mpsc::BoundedAsyncReceiver<(TKJobId, TKJobRequest, Arc<BoxedExecFn>)>,
   cmd_rx: mpsc::BoundedAsyncReceiver<CoordinatorCommand>,
   shutdown_rx: watch::Receiver<Option<ShutdownMode>>,
+  worker_outcome_tx: mpsc::BoundedAsyncSender<WorkerOutcome>,
   worker_outcome_rx: mpsc::BoundedAsyncReceiver<WorkerOutcome>,
   // Sender
   job_dispatch_tx: AsyncSender<JobDispatchTuple>,
+  job_dispatch_rx: mpmc::AsyncReceiver<JobDispatchTuple>,
   // Shared Data Structures (protected by locks)
   job_definitions: Arc<RwLock<HashMap<TKJobId, JobDefinition>>>,
   cancellations: Arc<RwLock<HashSet<TKJobId>>>,
+  quarantined_jobs: Arc<RwLock<HashSet<TKJobId>>>,
   instance_to_lineage: Arc<RwLock<HashMap<InstanceId, TKJobId>>>,
   // Metrics & Counters
   metrics: SchedulerMetrics,
   active_workers_counter: Arc<AtomicUsize>,
   max_workers: usize,
+  worker_handles: Vec<JoinHandle<()>>,
 }
 
 impl CoordinatorState {
@@ -49,27 +57,35 @@ impl CoordinatorState {
     cmd_rx: mpsc::BoundedAsyncReceiver<CoordinatorCommand>,
     shutdown_rx: watch::Receiver<Option<ShutdownMode>>,
     job_dispatch_tx: AsyncSender<JobDispatchTuple>,
+    job_dispatch_rx: mpmc::AsyncReceiver<JobDispatchTuple>,
+    worker_outcome_tx: mpsc::BoundedAsyncSender<WorkerOutcome>,
     worker_outcome_rx: mpsc::BoundedAsyncReceiver<WorkerOutcome>,
     job_definitions: Arc<RwLock<HashMap<TKJobId, JobDefinition>>>,
     cancellations: Arc<RwLock<HashSet<TKJobId>>>,
+    quarantined_jobs: Arc<RwLock<HashSet<TKJobId>>>,
     instance_to_lineage: Arc<RwLock<HashMap<InstanceId, TKJobId>>>,
     metrics: SchedulerMetrics,
     active_workers_counter: Arc<AtomicUsize>,
     max_workers: usize,
+    worker_handles: Vec<JoinHandle<()>>,
   ) -> Self {
     Self {
       pq_type,
       staging_rx,
       cmd_rx,
       shutdown_rx,
+      worker_outcome_tx,
       worker_outcome_rx,
       job_dispatch_tx,
+      job_dispatch_rx,
       job_definitions,
       cancellations,
+      quarantined_jobs,
       instance_to_lineage,
       metrics,
       active_workers_counter,
       max_workers,
+      worker_handles,
     }
   }
 }
@@ -160,134 +176,163 @@ impl Coordinator {
   pub async fn run(&mut self) {
     info!("Coordinator started.");
 
+    let mut worker_handles = std::mem::take(&mut self.state.worker_handles);
+
     loop {
-      // Update gauge metrics (approximate for channels)
+      // Update gauge metrics
       self.update_gauge_metrics().await;
 
-      // 1. HIGHEST PRIORITY: Always attempt to dispatch any ready jobs first.
-      //    This ensures that if a worker is free and a job is due, we act on it
-      //    immediately, rather than after a select{} block.
       if self.shutting_down != Some(ShutdownMode::Graceful) {
-          self.try_dispatch_jobs().await;
+        self.try_dispatch_jobs().await;
       }
-
-      // Calculate sleep duration based on next job time and current time
       let sleep_duration = self.calculate_sleep().await;
 
-      // --- Main Event Loop ---
+      // Check for graceful exit condition *before* the next select.
+      if self.shutting_down == Some(ShutdownMode::Graceful) {
+        let active_count = self.state.active_workers_counter.load(AtomicOrdering::Relaxed);
+        if active_count == 0 {
+          info!("Graceful shutdown: All workers are idle. Coordinator exiting.");
+          break; // Exit the main loop.
+        } else {
+          trace!(
+            "Graceful shutdown: Waiting for {} active worker(s) to finish.",
+            active_count
+          );
+        }
+      }
+
       tokio::select! {
-        biased; // Prioritize checking the shutdown signal
+        biased;
 
-        // --- Shutdown Check ---
-        Ok(()) = self.state.shutdown_rx.changed() => {
-          let shutdown_mode_opt = *self.state.shutdown_rx.borrow();
-          // Process signal only if shutdown state actually changes
-          if shutdown_mode_opt != self.shutting_down {
-              if shutdown_mode_opt.is_some() {
-                  // Start shutdown process
-                  self.shutting_down = shutdown_mode_opt;
-                  info!(mode=?self.shutting_down.unwrap(), "Coordinator received shutdown signal.");
+        // --- BRANCH 1: Supervisor Check (only active if there are workers) ---
+        Some((result, index, remaining)) = async {
+          if worker_handles.is_empty() {
+            // This future will pend forever if there are no handles,
+            // effectively disabling this select branch.
+            std::future::pending().await
+          } else {
+            // select_all consumes the handles, so we drain them.
+            let (res, idx, rem) = select_all(worker_handles.drain(..)).await;
+            // Return Some, which will be matched by the pattern
+            Some((res, idx, rem))
+          }
+        } => {
+            // A worker terminated. Restore the remaining handles.
+            worker_handles = remaining;
 
-                  // Close channels to stop accepting new work and prevent rescheduling loops
-                  let _ = self.state.staging_rx.close();
-
-                  if self.shutting_down == Some(ShutdownMode::Force) {
-                      info!("Forced shutdown initiated, coordinator loop breaking.");
-                      break; // Exit loop immediately
-                  }
-                  // Continue loop for graceful shutdown handling
-              } else {
-                  // Signal changed from Some -> None (unexpected)
-                  warn!("Shutdown signal unexpectedly cleared. Resuming normal operation.");
-                  self.shutting_down = None;
-                  // We might need to re-open channels or re-initialize state if this were expected.
+            if self.shutting_down.is_some() {
+              trace!(worker_index = index, "Supervised worker terminated during planned shutdown.");
+            } else {
+              error!(worker_index = index, "Worker terminated unexpectedly! Respawning...");
+              if let Err(join_error) = result {
+                if join_error.is_panic() {
+                  let panic_payload = join_error.into_panic();
+                  let panic_info = panic_payload
+                    .downcast_ref::<&'static str>()
+                    .map(|s| *s)
+                    .or_else(|| panic_payload.downcast_ref::<String>().map(|s| s.as_str()))
+                    .unwrap_or("Unknown panic payload");
+                  error!(worker_index = index, panic_info, "Panic payload from terminated worker.");
+                }
               }
-          }
+              let new_handle = self.spawn_worker(index);
+              worker_handles.push(new_handle);
+            }
         },
 
-        // --- Staging Queue Processing ---
-        // Only process if not gracefully shutting down (or forced)
-        // Use `if self.shutting_down.is_none()` for clarity
-        maybe_job = self.state.staging_rx.recv(), if self.shutting_down.is_none() => {
-          if let Ok((lineage_id, request, exec_fn)) = maybe_job {
-            self.handle_new_job(lineage_id, request, exec_fn).await;
-          } else {
-            // Staging channel closed, expected during graceful shutdown initiation
-            trace!("Staging channel closed (expected during shutdown or handle drop).");
-          }
-        },
-
-        // --- Command Processing ---
-        // Always process commands, even during graceful shutdown
-        maybe_cmd = self.state.cmd_rx.recv() => {
-          if let Ok(cmd) = maybe_cmd {
-            self.handle_command(cmd).await;
-          } else {
-            // Command channel closed, likely scheduler handle dropped.
-            if self.shutting_down.is_none() {
-              warn!("Command channel closed unexpectedly. Initiating graceful shutdown.");
-
-              self.shutting_down = Some(ShutdownMode::Graceful);
-              // Ensure channels are closed if initiating shutdown here too
-              let _ = self.state.staging_rx.close();
-              let _ = self.state.worker_outcome_rx.close();
+        // --- BRANCH 2: Shutdown Check ---
+        Ok(()) = self.state.shutdown_rx.changed() => {
+          if self.shutting_down.is_none() && self.state.shutdown_rx.borrow().is_some() {
+            self.shutting_down = *self.state.shutdown_rx.borrow();
+            info!(mode=?self.shutting_down.unwrap(), "Coordinator received shutdown signal.");
+            let _ = self.state.staging_rx.close();
+            if self.shutting_down == Some(ShutdownMode::Force) {
+              break;
             }
           }
         },
 
-        // --- Worker Outcome Processing ---
-        // Process outcomes unless forced shutdown (Graceful needs to update state)
+        // --- Other branches (now much cleaner) ---
+        maybe_job = self.state.staging_rx.recv(), if self.shutting_down.is_none() => {
+          if let Ok((lineage_id, request, exec_fn)) = maybe_job {
+            self.handle_new_job(lineage_id, request, exec_fn).await;
+          } else {
+            trace!("Staging channel closed (expected during shutdown or handle drop).");
+          }
+        },
+        maybe_cmd = self.state.cmd_rx.recv() => {
+          if let Ok(cmd) = maybe_cmd {
+            self.handle_command(cmd).await;
+          } else {
+            if self.shutting_down.is_none() {
+              warn!("Command channel closed unexpectedly. Initiating graceful shutdown.");
+              self.shutting_down = Some(ShutdownMode::Graceful);
+              let _ = self.state.staging_rx.close();
+            }
+          }
+        },
         maybe_outcome = self.state.worker_outcome_rx.recv(), if self.shutting_down != Some(ShutdownMode::Force) => {
           if let Ok(outcome) = maybe_outcome {
             trace!("Received worker outcome: {:?}", outcome);
             self.handle_worker_outcome(outcome).await;
           } else {
-            // Outcome channel closed, expected during graceful shutdown
             if self.shutting_down.is_none() {
-                error!("Worker outcome channel closed unexpectedly!");
-                // Consider initiating shutdown here as well?
+              error!("Worker outcome channel closed unexpectedly! This indicates all workers panicked simultaneously. Initiating graceful shutdown.");
+              self.shutting_down = Some(ShutdownMode::Graceful);
+              let _ = self.state.staging_rx.close();
             }
           }
         },
-
-        // --- Timer Wakeup ---
-        // Only sleep if not shutting down forcefully and sleep duration > 0
         _ = async { sleep(sleep_duration).await }, if self.shutting_down != Some(ShutdownMode::Force) && sleep_duration > Duration::ZERO => {
           trace!("Timer fired.");
-          // Timer expired, check for ready jobs if not gracefully shutting down
           if self.shutting_down != Some(ShutdownMode::Graceful) {
             self.try_dispatch_jobs().await;
           }
         }
       } // end select!
-
-      // --- Post-Select Shutdown Logic ---
-      // Check if graceful shutdown is complete (all workers idle)
-      if self.shutting_down == Some(ShutdownMode::Graceful) {
-        let active_count = self.state.active_workers_counter.load(AtomicOrdering::Relaxed);
-        if active_count == 0 {
-          info!(
-            "Graceful shutdown: All workers idle ({}/{} active). Coordinator exiting.",
-            active_count, self.state.max_workers
-          );
-          break; // Exit loop
-        } else {
-          trace!(
-            active_workers = active_count,
-            "Graceful shutdown: Waiting for active workers."
-          );
-          // Don't sleep here, rely on worker outcomes triggering the select loop
-          // or the short sleep in calculate_sleep during shutdown.
-        }
-      }
-      // Force shutdown breaks loop inside select!
     } // end loop
 
+    info!("Coordinator main loop finished. Awaiting worker task termination...");
+    let _ = self.state.job_dispatch_tx.close(); // Ensure workers wake up and see closed channel
+
+    // Wait for all worker tasks to finish.
+    for (i, handle) in worker_handles.into_iter().enumerate() {
+      if let Err(e) = handle.await {
+        error!(
+          worker_id = i,
+          "Worker task panicked during final shutdown join: {:?}", e
+        );
+      }
+    }
+
     info!("Coordinator task shutting down.");
-    // Close dispatch channel explicitly if not already closed.
-    // This signals any remaining waiting workers that no more jobs are coming.
     let _ = self.state.job_dispatch_tx.close();
-  } // end run()
+  }
+
+  /// Spawns a new worker task and returns its JoinHandle.
+  fn spawn_worker(&self, worker_id: usize) -> JoinHandle<()> {
+    // Clone all the shared state needed by a worker from the coordinator's own state.
+    let worker_job_definitions = self.state.job_definitions.clone();
+    let worker_metrics = self.state.metrics.clone();
+    let worker_shutdown_rx = self.state.shutdown_rx.clone();
+    let worker_active_counter = self.state.active_workers_counter.clone();
+    // This now works because CoordinatorState owns the receiver.
+    let worker_job_dispatch_rx = self.state.job_dispatch_rx.clone();
+    let worker_outcome_tx_clone = self.state.worker_outcome_tx.clone();
+
+    tokio::spawn(async move {
+      let mut worker = Worker::new(
+        worker_id,
+        worker_job_definitions,
+        worker_metrics,
+        worker_shutdown_rx,
+        worker_outcome_tx_clone,
+        worker_job_dispatch_rx,
+        worker_active_counter,
+      );
+      worker.run().await;
+    })
+  }
 
   /// Updates gauge metrics based on current state.
   async fn update_gauge_metrics(&self) {
@@ -420,64 +465,8 @@ impl Coordinator {
         let _ = responder.send(snapshot);
       }
       CoordinatorCommand::CancelJob { job_id, responder } => {
-        // Need write locks to modify state
-
-        let mut should_wake_timer = false; // Flag to wake outside lock scope
-        let response: Result<(), QueryError>; // Store the result to send later
-        let mut instance_id_to_remove_opt = None;
-        let mut already_cancelled = true;
-
-        if let Some(def) = self.state.job_definitions.write().get_mut(&job_id) {
-          let mut cancellations_guard = self.state.cancellations.write();
-          already_cancelled = !cancellations_guard.insert(job_id);
-          if !already_cancelled {
-            trace!(%job_id, "Marked job lineage as cancelled.");
-            // *** Clear next_run when lineage is cancelled ***
-            def.request.next_run = None;
-            // *** Also clear instance ID immediately ***
-            instance_id_to_remove_opt = def.current_instance_id.take();
-
-            self
-              .state
-              .metrics
-              .jobs_lineage_cancelled
-              .fetch_add(1, AtomicOrdering::Relaxed);
-          } else {
-            // Already cancelled, Idempotent success
-            debug!(%job_id, "Job was already marked as cancelled.");
-          }
-
-          response = Ok(());
-          drop(cancellations_guard);
-        } else {
-          // Job not found
-          warn!(%job_id, "Attempted to cancel non-existent job.");
-          response = Err(QueryError::JobNotFound(job_id));
-        }
-
-        if !already_cancelled {
-          // Try proactive removal if HandleBased PQ
-          if self.state.pq_type == PriorityQueueType::HandleBased {
-            if let Some(instance_id_to_remove) = instance_id_to_remove_opt {
-              // Remove from instance map under its lock
-              self.state.instance_to_lineage.write().remove(&instance_id_to_remove);
-
-              if self.pq.remove(&instance_id_to_remove).await {
-                trace!(%job_id, %instance_id_to_remove, "Proactively removed cancelled instance.");
-                should_wake_timer = true;
-              } else {
-                trace!(%job_id, %instance_id_to_remove, "Instance to remove for cancellation not found in PQ.");
-              }
-            }
-          }
-        }
-        // Send response *after* all locks are dropped and potential awaits complete
+        let response = self.handle_cancel_job_internal(job_id).await;
         let _ = responder.send(response);
-
-        // Call try_wake_timer *after* everything else
-        if should_wake_timer {
-          self.try_wake_timer();
-        }
       }
       CoordinatorCommand::UpdateJob {
         job_id,
@@ -611,6 +600,31 @@ impl Coordinator {
           AtomicOrdering::Relaxed,
         );
         // Maps should have been cleaned before dispatch, but maybe log or check.
+      }
+
+      WorkerOutcome::Panic {
+        lineage_id,
+        completed_instance_id,
+        panic_info,
+      } => {
+        error!(
+          %lineage_id,
+          %completed_instance_id,
+          %panic_info,
+          "Worker reported a panic. Quarantining job lineage."
+        );
+
+        // Add to the quarantine list.
+        self.state.quarantined_jobs.write().insert(lineage_id);
+
+        // Clean up the instance that just ran (and panicked).
+        self.cleanup_instance_maps(completed_instance_id, lineage_id).await;
+
+        // Reuse the cancellation logic to mark the job as 'cancelled'
+        // and remove it from the priority queue. This effectively disables it.
+        if let Err(e) = self.handle_cancel_job_internal(lineage_id).await {
+          error!(%lineage_id, error = ?e, "Failed to perform cleanup after quarantining job.");
+        }
       }
     }
   }
@@ -830,6 +844,20 @@ impl Coordinator {
           };
 
           if let Some(lineage_id) = lineage_id_opt {
+            // Check quarantine list first.
+            let is_quarantined = { self.state.quarantined_jobs.read().contains(&lineage_id) };
+
+            if is_quarantined {
+              warn!(
+                  %lineage_id,
+                  %ready_instance_id,
+                  "Discarding quarantined job instance popped from PQ."
+              );
+              // We could add a new metric here, e.g., jobs_instance_discarded_quarantined
+              self.cleanup_instance_maps(ready_instance_id, lineage_id).await;
+              continue; // Check the next job
+            }
+
             let is_cancelled = {
               let cancellations = self.state.cancellations.read();
               cancellations.contains(&lineage_id)
@@ -1005,5 +1033,55 @@ impl Coordinator {
       i_to_l_map.remove(&instance_id);
     }
     // Cannot efficiently find JobDefinition to clear its state.
+  }
+
+  async fn handle_cancel_job_internal(&mut self, job_id: TKJobId) -> Result<(), QueryError> {
+    let mut should_wake_timer = false;
+    let mut instance_id_to_remove_opt = None;
+    let mut already_cancelled = true;
+
+    if let Some(def) = self.state.job_definitions.write().get_mut(&job_id) {
+      let mut cancellations_guard = self.state.cancellations.write();
+      already_cancelled = !cancellations_guard.insert(job_id);
+      if !already_cancelled {
+        trace!(%job_id, "Marked job lineage as cancelled.");
+        def.request.next_run = None;
+        instance_id_to_remove_opt = def.current_instance_id.take();
+
+        self
+          .state
+          .metrics
+          .jobs_lineage_cancelled
+          .fetch_add(1, AtomicOrdering::Relaxed);
+      } else {
+        debug!(%job_id, "Job was already marked as cancelled.");
+      }
+
+      drop(cancellations_guard);
+    } else {
+      warn!(%job_id, "Attempted to cancel non-existent job.");
+      return Err(QueryError::JobNotFound(job_id));
+    }
+
+    if !already_cancelled {
+      if self.state.pq_type == PriorityQueueType::HandleBased {
+        if let Some(instance_id_to_remove) = instance_id_to_remove_opt {
+          self.state.instance_to_lineage.write().remove(&instance_id_to_remove);
+
+          if self.pq.remove(&instance_id_to_remove).await {
+            trace!(%job_id, %instance_id_to_remove, "Proactively removed cancelled instance.");
+            should_wake_timer = true;
+          } else {
+            trace!(%job_id, %instance_id_to_remove, "Instance to remove for cancellation not found in PQ.");
+          }
+        }
+      }
+    }
+
+    if should_wake_timer {
+      self.try_wake_timer();
+    }
+
+    Ok(())
   }
 } // end impl Coordinator
