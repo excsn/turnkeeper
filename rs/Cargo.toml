@@ -1,6 +1,6 @@
 [package]
 name = "turnkeeper"
-version = "1.2.6"
+version = "1.2.7"
 edition = "2024"
 description = "An asynchronous, recurring job scheduler for Tokio with support for CRON, interval, and weekday/time schedules, plus retries, cancellation, and observability."
 
@@ -15,7 +15,8 @@ categories = ["asynchronous", "concurrency", "date-and-time", "network-programmi
 [dependencies]
 chrono = { version = "^0.4", features = ["serde"] }
 cron = { version = "^0.12", optional = true }
-fibre = "^0.5"
+fibre = "0.5"
+fibre_cache = { version = "0.4", default-features = false, features = ["tokio"] }
 futures = "^0.3"
 parking_lot = "^0.12"
 priority-queue = { version = "^2.5", optional = true }

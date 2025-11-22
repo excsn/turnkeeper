@@ -7,13 +7,14 @@ use crate::worker::Worker;
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use fibre::mpmc;
 use fibre::{mpmc::AsyncSender, mpsc};
+use fibre_cache::Cache;
 use futures::future::select_all;
 use parking_lot::{Mutex, RwLock};
 use priority_queue::priority_queue::PriorityQueue;
@@ -39,6 +40,8 @@ pub(crate) struct CoordinatorState {
   job_dispatch_rx: mpmc::AsyncReceiver<JobDispatchTuple>,
   // Shared Data Structures (protected by locks)
   job_definitions: Arc<RwLock<HashMap<TKJobId, JobDefinition>>>,
+  // Key: TKJobId, Value: JobDefinition, Hasher: RandomState (std default for simplicity)
+  job_history: Arc<Cache<TKJobId, JobDefinition>>,
   cancellations: Arc<RwLock<HashSet<TKJobId>>>,
   quarantined_jobs: Arc<RwLock<HashSet<TKJobId>>>,
   instance_to_lineage: Arc<RwLock<HashMap<InstanceId, TKJobId>>>,
@@ -50,7 +53,7 @@ pub(crate) struct CoordinatorState {
 }
 
 impl CoordinatorState {
-  #[allow(clippy::too_many_arguments)] // Necessary complexity for Coordinator setup
+  #[allow(clippy::too_many_arguments)]
   pub fn new(
     pq_type: PriorityQueueType,
     staging_rx: mpsc::BoundedAsyncReceiver<(TKJobId, TKJobRequest, Arc<BoxedExecFn>)>,
@@ -61,6 +64,7 @@ impl CoordinatorState {
     worker_outcome_tx: mpsc::BoundedAsyncSender<WorkerOutcome>,
     worker_outcome_rx: mpsc::BoundedAsyncReceiver<WorkerOutcome>,
     job_definitions: Arc<RwLock<HashMap<TKJobId, JobDefinition>>>,
+    job_history: Arc<Cache<TKJobId, JobDefinition>>,
     cancellations: Arc<RwLock<HashSet<TKJobId>>>,
     quarantined_jobs: Arc<RwLock<HashSet<TKJobId>>>,
     instance_to_lineage: Arc<RwLock<HashMap<InstanceId, TKJobId>>>,
@@ -79,6 +83,7 @@ impl CoordinatorState {
       job_dispatch_tx,
       job_dispatch_rx,
       job_definitions,
+      job_history,
       cancellations,
       quarantined_jobs,
       instance_to_lineage,
@@ -420,44 +425,42 @@ impl Coordinator {
   async fn handle_command(&mut self, cmd: CoordinatorCommand) {
     match cmd {
       CoordinatorCommand::GetJobDetails { job_id, responder } => {
-        // Use read locks
+        // 1. Check Active Map
         let definitions = self.state.job_definitions.read();
-        let cancellations = self.state.cancellations.read();
-
-        let result = definitions.get(&job_id).map(|def| {
-          let is_cancelled = cancellations.contains(&job_id);
-          let next_run_time = def.request.next_run; // Get from request state
-
-          JobDetails {
-            id: def.lineage_id,
-            name: def.request.name.clone(),
-            schedule: def.request.schedule.clone(),
-            max_retries: def.request.max_retries,
-            retry_count: def.request.retry_count,
-            retry_delay: def.request.retry_delay,
-            next_run_instance: def.current_instance_id,
-            next_run_time, // Use the time stored in the definition state
-            is_cancelled,
-          }
+        let mut result = definitions.get(&job_id).map(|def| {
+          self.map_definition_to_details(def) // Helper extracted below for reuse
         });
+        drop(definitions); // Release lock early
+
+        // 2. If not active, Check History Cache
+        if result.is_none() {
+          // .get() applies closure to reference without cloning value
+          result = self
+            .state
+            .job_history
+            .get(&job_id, |def| self.map_definition_to_details(def));
+        }
+
         let _ = responder.send(result.ok_or(QueryError::JobNotFound(job_id)));
       }
       CoordinatorCommand::ListAllJobs { responder } => {
         let definitions = self.state.job_definitions.read();
-        let cancellations = self.state.cancellations.read();
-        let summaries = definitions
+
+        // 1. Collect Active Jobs
+        let mut summaries: Vec<JobSummary> = definitions
           .values()
-          .map(|def| {
-            let is_cancelled = cancellations.contains(&def.lineage_id);
-            JobSummary {
-              id: def.lineage_id,
-              name: def.request.name.clone(),
-              next_run: def.request.next_run, // Use stored time
-              retry_count: def.request.retry_count,
-              is_cancelled,
-            }
-          })
+          .map(|def| self.map_definition_to_summary(def))
           .collect();
+
+        drop(definitions);
+
+        // 2. Collect History Jobs (Optional, but good for visibility)
+        // fibre_cache iter is weakly consistent
+        for (_id, def_arc) in self.state.job_history.iter() {
+          // def_arc is Arc<JobDefinition>, dereference it to pass &JobDefinition
+          summaries.push(self.map_definition_to_summary(&def_arc));
+        }
+
         let _ = responder.send(summaries);
       }
       CoordinatorCommand::GetMetricsSnapshot { responder } => {
@@ -496,11 +499,6 @@ impl Coordinator {
         let now = Utc::now();
         let schedule_lateness = now.signed_duration_since(completed_instance_scheduled_time);
 
-        // We can log this information. Using an `info` level is good for important
-        // state changes, or `debug` if it's too noisy. Let's use `info` for now.
-        // The format will look like:
-        // "Rescheduled job instance. Lateness: 5.123s"
-        // "Rescheduled job instance. On-time by: 50ms" (if it somehow ran early)
         if schedule_lateness.num_milliseconds() > 0 {
           debug!(
               %lineage_id,
@@ -572,18 +570,26 @@ impl Coordinator {
       } => {
         debug!(%lineage_id, failed = is_permanent_failure, "Job lineage complete (no more runs scheduled).");
         self.cleanup_instance_maps(completed_instance_id, lineage_id).await;
-        // Update state: Clear current instance ID, reset retry count
-        {
-          let mut definitions = self.state.job_definitions.write();
-          if let Some(def) = definitions.get_mut(&lineage_id) {
-            def.current_instance_id = None;
-            def.request.next_run = None; // Explicitly mark no next run
-            def.request.retry_count = 0; // Reset just in case
-          }
-          // Instance map already cleaned before dispatch.
 
-          // Optional: Remove definition entirely?
-          // definitions.remove(&lineage_id);
+        // CHANGED: Move from Map -> History Cache
+        let mut completed_def_opt = None;
+        {
+          // Write lock to remove
+          let mut definitions = self.state.job_definitions.write();
+          if let Some(mut def) = definitions.remove(&lineage_id) {
+            // Clean up state before archiving
+            def.current_instance_id = None;
+            def.request.next_run = None;
+            def.request.retry_count = 0;
+            completed_def_opt = Some(def);
+          }
+        }
+
+        if let Some(def) = completed_def_opt {
+          // Insert into history with cost 1
+          // TTL is handled by the cache configuration
+          self.state.job_history.insert(lineage_id, def, 1);
+          debug!(%lineage_id, "Moved completed job to history cache.");
         }
       }
       WorkerOutcome::FetchFailed {
@@ -723,78 +729,114 @@ impl Coordinator {
 
   /// Handles the logic for the TriggerJobNow command.
   async fn handle_trigger_job_now(&mut self, job_id: TKJobId) -> Result<(), QueryError> {
-    let (instance_id, trigger_time) = {
-      // ——————————————————————————————————————————————
-      // 1) Read‐lock and existence/cancellation checks (unchanged)
+    // ------------------------------------------------------------------
+    // PHASE 1: READ & VALIDATION (Sync)
+    // ------------------------------------------------------------------
+    let mut preempt_instance_id: Option<InstanceId> = None;
+    let mut should_reject = false;
+
+    {
+      // Scope for Read Lock checks
       let definitions = self.state.job_definitions.read();
+      let def = definitions.get(&job_id).ok_or(QueryError::JobNotFound(job_id))?;
+
+      // Check cancellation
       let cancellations = self.state.cancellations.read();
-
-      if !definitions.contains_key(&job_id) {
-        warn!(%job_id, "Attempted to trigger non-existent job.");
-        drop(cancellations);
-        drop(definitions);
-        return Err(QueryError::JobNotFound(job_id));
-      }
-
       if cancellations.contains(&job_id) {
-        warn!(%job_id, "Attempted to trigger cancelled job.");
-        drop(cancellations);
-        drop(definitions);
         return Err(QueryError::TriggerFailedJobCancelled(job_id));
       }
-      // ——————————————————————————————————————————————
-
-      // ——————————————————————————————————————————————
-      // 2) **ONLY** reject if this is a one-off (`Schedule::Once`) AND it already has an instance
-      let def = definitions.get(&job_id).unwrap();
-      if let crate::job::Schedule::Once(_) = &def.request.schedule {
-        if def.current_instance_id.is_some() {
-          warn!(%job_id, "Attempted to trigger a one-off job already scheduled.");
-          drop(cancellations);
-          drop(definitions);
-          return Err(QueryError::TriggerFailedJobScheduled(job_id));
-        }
-      }
-      // For recurring (or `Never`) schedules, we fall through and allow the trigger.
-      // ——————————————————————————————————————————————
-
       drop(cancellations);
-      drop(definitions);
 
-      // 3) Create the manual‐trigger instance
-      let instance_id = Uuid::new_v4();
-      let trigger_time = Utc::now();
-
-      {
-        // Write‐lock: register in instance→lineage map
-        let mut i_to_l_map = self.state.instance_to_lineage.write();
-        i_to_l_map.insert(instance_id, job_id);
-      }
-
-      {
-        // Write‐lock: update JobDefinition **only for one-offs**
-        let mut defs = self.state.job_definitions.write();
-        if let Some(def_mut) = defs.get_mut(&job_id) {
-          // CHANGE: override for one-offs AND Never
-          match def_mut.request.schedule {
-            crate::job::Schedule::Once(_) | crate::job::Schedule::Never => {
-              def_mut.current_instance_id = Some(instance_id);
-              def_mut.request.retry_count = 0;
-            }
-            _ => {
-              // recurring: leave current_instance_id pointing at the real schedule
-            }
+      // Check current state for preemption logic
+      if let Some(existing_id) = def.current_instance_id {
+        if let Some(next_run) = def.request.next_run {
+          if next_run <= Utc::now() {
+            // Case A: Job is already scheduled to run NOW or is Overdue.
+            // It is waiting for a worker or currently being picked up.
+            // REJECT (Debounce)
+            should_reject = true;
+          } else {
+            // Case B: Job is scheduled for the Future.
+            // PREEMPT (Cancel future run, schedule now)
+            preempt_instance_id = Some(existing_id);
           }
+        } else {
+          // next_run is None -> Job is currently executing.
+          // REJECT
+          should_reject = true;
         }
       }
+    } // Drop read lock
 
-      (instance_id, trigger_time)
-    };
+    if should_reject {
+      debug!(%job_id, "Trigger rejected: Job is executing or already queued for execution.");
+      return Err(QueryError::TriggerFailedJobScheduled(job_id));
+    }
 
-    // 4) Enqueue the trigger and immediately dispatch it
-    self.pq.push(instance_id, trigger_time).await;
-    debug!(%job_id, %instance_id, trigger_time=%trigger_time,
-          "Manually triggered job instance scheduled.");
+    // ------------------------------------------------------------------
+    // PHASE 2: CLEANUP / PREEMPTION (Sync/Async mixed)
+    // ------------------------------------------------------------------
+
+    if let Some(instance_id) = preempt_instance_id {
+      // 1. Invalidate the old instance immediately by removing the mapping.
+      // This is the "Lazy Invalidation" key:
+      // - If HandleBased: We remove from PQ below.
+      // - If BinaryHeap: We can't remove from PQ. It remains as a "Ghost".
+      //   When the Ghost pops later, `try_dispatch_jobs` will fail to find it
+      //   in `instance_to_lineage` and discard it.
+      self.state.instance_to_lineage.write().remove(&instance_id);
+
+      // 2. Proactive cleanup if possible
+      if self.state.pq_type == PriorityQueueType::HandleBased {
+        // Safe to await here because no locks are held
+        if self.pq.remove(&instance_id).await {
+          trace!(%job_id, %instance_id, "Proactively removed future scheduled instance (HandleBased).");
+        }
+      } else {
+        trace!(%job_id, %instance_id, "Invalidated future scheduled instance (BinaryHeap Ghost).");
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // PHASE 3: WRITE & SCHEDULE (Sync + Async Push)
+    // ------------------------------------------------------------------
+    let new_instance_id = Uuid::new_v4();
+    let trigger_time = Utc::now();
+
+    {
+      let mut definitions = self.state.job_definitions.write();
+      // Re-acquire lock to update definition
+      if let Some(def) = definitions.get_mut(&job_id) {
+        def.current_instance_id = Some(new_instance_id);
+        def.request.next_run = Some(trigger_time);
+
+        // This prevents the worker from rescheduling the original future run
+        // after this manual instance completes.
+        if let crate::job::Schedule::Once(_) = def.request.schedule {
+          def.request.schedule = crate::job::Schedule::Once(trigger_time);
+        }
+        
+        // Reset retry count for manual runs
+        if matches!(
+          def.request.schedule,
+          crate::job::Schedule::Once(_) | crate::job::Schedule::Never
+        ) {
+          def.request.retry_count = 0;
+        }
+        // For recurring, we are forcing a new run cycle, reset retries.
+        def.request.retry_count = 0;
+      } else {
+        return Err(QueryError::JobNotFound(job_id));
+      }
+    }
+
+    // Register valid instance
+    self.state.instance_to_lineage.write().insert(new_instance_id, job_id);
+
+    // Push to PQ
+    self.pq.push(new_instance_id, trigger_time).await;
+
+    debug!(%job_id, %new_instance_id, "Manually triggered job scheduled.");
     self.try_wake_timer();
     self.try_dispatch_jobs().await;
 
@@ -815,8 +857,7 @@ impl Coordinator {
       if active_workers >= self.state.max_workers {
         trace!(
           "Dispatch check: All workers busy ({}/{})",
-          active_workers,
-          self.state.max_workers
+          active_workers, self.state.max_workers
         );
         break; // All workers are busy
       }
@@ -1084,4 +1125,33 @@ impl Coordinator {
 
     Ok(())
   }
-} // end impl Coordinator
+
+  // Helper to avoid code duplication between Map and Cache checks
+  fn map_definition_to_details(&self, def: &JobDefinition) -> JobDetails {
+    let cancellations = self.state.cancellations.read(); // Quick lock
+    let is_cancelled = cancellations.contains(&def.lineage_id);
+    JobDetails {
+      id: def.lineage_id,
+      name: def.request.name.clone(),
+      schedule: def.request.schedule.clone(),
+      max_retries: def.request.max_retries,
+      retry_count: def.request.retry_count,
+      retry_delay: def.request.retry_delay,
+      next_run_instance: def.current_instance_id,
+      next_run_time: def.request.next_run,
+      is_cancelled,
+    }
+  }
+
+  fn map_definition_to_summary(&self, def: &JobDefinition) -> JobSummary {
+    let cancellations = self.state.cancellations.read();
+    let is_cancelled = cancellations.contains(&def.lineage_id);
+    JobSummary {
+      id: def.lineage_id,
+      name: def.request.name.clone(),
+      next_run: def.request.next_run,
+      retry_count: def.request.retry_count,
+      is_cancelled,
+    }
+  }
+}

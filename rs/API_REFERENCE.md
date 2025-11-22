@@ -64,16 +64,23 @@ See [`SchedulerBuilder`](#schedulerbuilder) for all configuration options.
     *   **Errors:** [`QueryError::SchedulerShutdown`], [`QueryError::ResponseFailed`], [`QueryError::JobNotFound`], [`QueryError::UpdateRequiresHandleBasedPQ`], [`QueryError::UpdateFailed`]
 
 *   `async fn trigger_job_now(&self, job_id: TKJobId) -> Result<(), QueryError>`
-    *   Manually triggers a job lineage to run as soon as possible, regardless of its regular schedule. Creates a new job instance.
-    *   **Constraints:** Job must exist and not be cancelled. For `Schedule::Once` jobs, it must not already have an instance scheduled/running.
-    *   **Errors:** [`QueryError::SchedulerShutdown`], [`QueryError::ResponseFailed`], [`QueryError::JobNotFound`], [`QueryError::TriggerFailedJobCancelled`], [`QueryError::TriggerFailedJobScheduled`], [`QueryError::TriggerFailed`]
+    *   Manually triggers a job lineage to run as soon as possible.
+    *   **Behavior:**
+        *   **Preemption:** If the job is currently scheduled for the *future*, that run is cancelled/preempted and replaced by this immediate trigger.
+        *   **Idempotency:** If the job is currently **executing** or queued for **immediate** execution (pending), the request is rejected to prevent duplicate/stacked runs.
+    *   **Errors:**
+        *   [`QueryError::TriggerFailedJobScheduled`]: Returned if the job is already running or queued for immediate execution.
+        *   [`QueryError::TriggerFailedJobCancelled`]: Returned if the job is marked as cancelled.
+        *   [`QueryError::JobNotFound`], [`QueryError::SchedulerShutdown`], [`QueryError::ResponseFailed`].
 
 *   `async fn get_job_details(&self, job_id: TKJobId) -> Result<JobDetails, QueryError>`
-    *   Retrieves detailed information about a specific job lineage. The `schedule` field in `JobDetails` will be of type [`Schedule`].
-    *   **Errors:** [`QueryError::SchedulerShutdown`], [`QueryError::ResponseFailed`], [`QueryError::JobNotFound`]
+    *   Retrieves detailed information about a specific job lineage.
+    *   **History:** Includes jobs that have **completed** or **failed permanently**. These are retained in an internal history cache (default TTL: 1 hour) after execution finishes.
+    *   **Errors:** [`QueryError::SchedulerShutdown`], [`QueryError::ResponseFailed`], [`QueryError::JobNotFound`] (if ID is unknown or expired from history).
 
 *   `async fn list_all_jobs(&self) -> Result<Vec<JobSummary>, QueryError>`
-    *   Retrieves summary information for all known job lineages (including potentially cancelled ones not yet fully removed).
+    *   Retrieves summary information for all active job lineages.
+    *   **History:** Also includes **completed** or **permanently failed** jobs currently stored in the internal history cache.
     *   **Errors:** [`QueryError::SchedulerShutdown`], [`QueryError::ResponseFailed`]
 
 *   `async fn get_metrics_snapshot(&self) -> Result<MetricsSnapshot, QueryError>`

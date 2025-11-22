@@ -6,16 +6,15 @@ mod common;
 use crate::common::{build_scheduler, job_exec_counter_result, job_exec_flag, setup_tracing};
 use chrono::{Duration as ChronoDuration, Utc};
 use std::sync::{
-  atomic::{AtomicBool, AtomicUsize, Ordering},
   Arc,
+  atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration as StdDuration;
 use turnkeeper::{
-  job::{TKJobRequest, Schedule},
+  QueryError,
+  job::{Schedule, TKJobRequest},
   job_fn, // Use the macro
   scheduler::PriorityQueueType,
-  QueryError,
-  TurnKeeper,
 };
 use uuid::Uuid;
 
@@ -42,13 +41,10 @@ async fn test_trigger_job_success() {
 
   // 2. Trigger the job
   tracing::info!(%job_id, "Triggering job now.");
-  scheduler
-    .trigger_job_now(job_id)
-    .await
-    .expect("Trigger job failed");
+  scheduler.trigger_job_now(job_id).await.expect("Trigger job failed");
 
   // 3. Wait for it to execute
-  tokio::time::sleep(StdDuration::from_millis(0500)).await; 
+  tokio::time::sleep(StdDuration::from_millis(500)).await;
 
   // 4. Verify it ran exactly once
   assert_eq!(
@@ -59,7 +55,10 @@ async fn test_trigger_job_success() {
 
   // 5. Verify details (it should be completed, as it was like a one-off)
   let details = scheduler.get_job_details(job_id).await.unwrap();
-  assert!(details.next_run_time.is_none(), "Triggered job should have no next run time afterwards (unless it had its own recurring schedule)");
+  assert!(
+    details.next_run_time.is_none(),
+    "Triggered job should have no next run time afterwards (unless it had its own recurring schedule)"
+  );
   assert!(
     details.next_run_instance.is_none(),
     "Triggered job should have no instance afterwards"
@@ -112,15 +111,19 @@ async fn test_trigger_job_cancelled() {
   scheduler.shutdown_graceful(None).await.unwrap();
 }
 
+/// Tests that triggering a job already scheduled for the future **Preempts** it.
+/// It should execute NOW, not 5 seconds later.
 #[tokio::test]
-async fn test_trigger_job_already_scheduled() {
+async fn test_trigger_job_preempts_schedule() {
   setup_tracing();
-  let scheduler = build_scheduler(1, PriorityQueueType::BinaryHeap).unwrap();
-  let flag = Arc::new(AtomicBool::new(false)); // To check if it runs twice
+  // Using HandleBased makes preemption cleaner (physical removal), but BinaryHeap
+  // should also work via Lazy Invalidation logic.
+  let scheduler = build_scheduler(1, PriorityQueueType::HandleBased).unwrap();
+  let flag = Arc::new(AtomicBool::new(false));
 
-  // 1. Add a job scheduled to run soon (but after our trigger attempt)
-  let run_time = Utc::now() + ChronoDuration::seconds(5); // Scheduled 5s out
-  let job_req = TKJobRequest::new("Trigger Scheduled", Schedule::Once(run_time), 0);
+  // 1. Add a job scheduled to run in 5 seconds
+  let run_time = Utc::now() + ChronoDuration::seconds(5);
+  let job_req = TKJobRequest::new("Trigger Preempt", Schedule::Once(run_time), 0);
   let job_id = scheduler
     .add_job_async(job_req, job_exec_flag(flag.clone(), StdDuration::ZERO))
     .await
@@ -128,32 +131,37 @@ async fn test_trigger_job_already_scheduled() {
 
   tokio::time::sleep(StdDuration::from_millis(100)).await; // Ensure it's in the PQ
 
-  // 2. Attempt to trigger it *while* it's scheduled
+  // 2. Attempt to trigger it NOW.
+  // UPDATED EXPECTATION: This should SUCCEED and PREEMPT the future run.
+  tracing::info!("Triggering future job now...");
   let result = scheduler.trigger_job_now(job_id).await;
 
   assert!(
-    matches!(result, Err(QueryError::TriggerFailedJobScheduled(id)) if id == job_id),
-    "Expected TriggerFailedJobScheduled error, got {:?}",
+    result.is_ok(),
+    "Triggering a scheduled job should succeed (Preemption). Got error: {:?}",
     result
   );
 
-  // 3. Verify it didn't run yet
+  // 3. Verify it runs IMMEDIATELY (within 500ms), not in 5s
+  tokio::time::sleep(StdDuration::from_millis(500)).await;
   assert!(
-    !flag.load(Ordering::SeqCst),
-    "Job should not have run from the failed trigger"
+    flag.load(Ordering::SeqCst),
+    "Job should have run immediately due to preemption trigger"
   );
 
   // 4. Shutdown (don't need to wait for original schedule)
   scheduler.shutdown_graceful(None).await.unwrap();
 }
 
+/// Tests that triggering an interval job replaces the next scheduled occurrence.
 #[tokio::test]
 async fn test_trigger_job_interacts_with_schedule() {
   setup_tracing();
   let scheduler = build_scheduler(1, PriorityQueueType::HandleBased).unwrap();
   let counter = Arc::new(AtomicUsize::new(0));
 
-  // 1. Add an interval job (e.g., every 2 seconds) starting in 1s
+  // 1. Add an interval job (every 2 seconds) starting in 1s
+  // Schedule: T+1, T+3, T+5...
   let interval = StdDuration::from_secs(2);
   let mut job_req = TKJobRequest::from_interval("Trigger Interval", interval, 0);
   job_req.with_initial_run_time(Utc::now() + ChronoDuration::seconds(1));
@@ -168,23 +176,25 @@ async fn test_trigger_job_interacts_with_schedule() {
 
   tokio::time::sleep(StdDuration::from_millis(50)).await;
 
-  // 2. Trigger the job immediately
+  // 2. Trigger the job immediately (at T+0.05s)
+  // This PREEMPTS the T+1 run.
+  // New Schedule: T+0.05 (Manual), T+2.05 (Next Interval)...
   tracing::info!(%job_id, "Triggering interval job now.");
-  scheduler
-    .trigger_job_now(job_id)
-    .await
-    .expect("Trigger failed");
+  scheduler.trigger_job_now(job_id).await.expect("Trigger failed");
 
-  // 3. Wait for trigger execution (~0.2s) + first scheduled run (~1s) + second scheduled run (~3s)
-  // Total wait ~3.5 seconds
+  // 3. Wait 3.5 seconds total.
+  // Timeline:
+  // ~0.05s: Trigger Executed (Count = 1)
+  // ~2.05s: Next Interval Executed (Count = 2)
+  // ~3.50s: Test End (Next run would be ~4.05s)
   tokio::time::sleep(StdDuration::from_millis(3500)).await;
 
   // 4. Verify execution count
-  // Expect: Trigger (@ ~0.1s) + Run 1 (@ ~1s) + Run 2 (@ ~3s) = 3 runs
+  // UPDATED EXPECTATION: 2 runs (1 Trigger replacing next, 1 Interval follow-up)
   let final_count = counter.load(Ordering::SeqCst);
   assert_eq!(
-    final_count, 3,
-    "Expected 3 runs (1 trigger + 2 scheduled), got {}",
+    final_count, 2,
+    "Expected 2 runs (1 preemption + 1 scheduled), got {}",
     final_count
   );
 

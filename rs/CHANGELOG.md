@@ -17,6 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [1.2.7] - 2025-11-22
+
+### Changed
+
+- Added a job history cache to handle job lineages that have failed/completed entirely in order to keep them queryable and expire them after some time.
+- Trigger Job Now is strictly idempotent to prevent multiple job instances from running. Only one instance can run now.
+
+## [1.2.6] - 2025-09-04
+
+### Fixed
+- Issue where a panicked worker could cause infinite wait during shutdown
+
 ## [1.2.5] - 2025-08-18
 
 ### Fixed

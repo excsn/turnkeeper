@@ -1,21 +1,22 @@
+use crate::Schedule;
 use crate::command::{CoordinatorCommand, JobUpdateData, ShutdownMode};
 use crate::coordinator::{Coordinator, CoordinatorState};
 use crate::error::{BuildError, QueryError, ShutdownError, SubmitError};
 use crate::job::{BoxedExecFn, InstanceId, JobDetails, JobSummary, MaxRetries, TKJobId, TKJobRequest};
 use crate::metrics::{MetricsSnapshot, SchedulerMetrics};
 use crate::worker::Worker;
-use crate::Schedule;
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use fibre::oneshot::oneshot;
-use fibre::{mpmc, mpsc, SendError, TrySendError};
+use fibre::{SendError, TrySendError, mpmc, mpsc};
+use fibre_cache::CacheBuilder;
 use futures::future::try_join_all;
 use parking_lot::{Mutex, RwLock};
 use tokio::runtime::Handle;
@@ -205,6 +206,15 @@ impl SchedulerBuilder {
       worker_handles.push(handle);
     }
 
+    // Keep completed jobs for 1 hour, check capacity, standard hasher
+    let job_history = Arc::new(
+      CacheBuilder::new()
+        .capacity(10_000) 
+        .time_to_live(Duration::from_secs(3600)) 
+        .build()
+        .expect("Failed to build cache"),
+    );
+    
     // --- Spawn Coordinator ---
     let coordinator_state = CoordinatorState::new(
       self.pq_type,
@@ -216,6 +226,7 @@ impl SchedulerBuilder {
       worker_outcome_tx,
       worker_outcome_rx,
       job_definitions.clone(),
+      job_history,
       cancellations.clone(),
       quarantined_jobs.clone(),
       instance_to_lineage.clone(),
@@ -581,38 +592,38 @@ impl TurnKeeper {
     // Take the coordinator handle. We will wait for it to finish.
     // The coordinator is now responsible for joining its worker handles.
     let coordinator_handle = match self.coordinator_handle.lock().take() {
-        Some(handle) => handle,
-        None => {
-            warn!("Shutdown called, but coordinator handle was already taken (already shut down?).");
-            return Err(ShutdownError::AlreadyShuttingDown);
-        }
+      Some(handle) => handle,
+      None => {
+        warn!("Shutdown called, but coordinator handle was already taken (already shut down?).");
+        return Err(ShutdownError::AlreadyShuttingDown);
+      }
     };
 
     let join_fut = async {
-        match coordinator_handle.await {
-            Ok(()) => {
-                info!("Coordinator task joined successfully.");
-                Ok(())
-            }
-            Err(e) => {
-                error!("Coordinator task panicked during shutdown: {:?}", e);
-                Err(ShutdownError::TaskPanic)
-            }
+      match coordinator_handle.await {
+        Ok(()) => {
+          info!("Coordinator task joined successfully.");
+          Ok(())
         }
+        Err(e) => {
+          error!("Coordinator task panicked during shutdown: {:?}", e);
+          Err(ShutdownError::TaskPanic)
+        }
+      }
     };
 
     if let Some(timeout) = timeout_duration {
-        match tokio::time::timeout(timeout, join_fut).await {
-            Ok(Ok(())) => Ok(()), // Timeout ok, join_fut ok
-            Ok(Err(e)) => Err(e),  // Timeout ok, join_fut returned an error
-            Err(_) => {
-                error!("Shutdown timed out waiting for the coordinator after {:?}", timeout);
-                Err(ShutdownError::Timeout)
-            }
+      match tokio::time::timeout(timeout, join_fut).await {
+        Ok(Ok(())) => Ok(()), // Timeout ok, join_fut ok
+        Ok(Err(e)) => Err(e), // Timeout ok, join_fut returned an error
+        Err(_) => {
+          error!("Shutdown timed out waiting for the coordinator after {:?}", timeout);
+          Err(ShutdownError::Timeout)
         }
+      }
     } else {
-        // No timeout, just wait forever.
-        join_fut.await
+      // No timeout, just wait forever.
+      join_fut.await
     }
   }
 }
