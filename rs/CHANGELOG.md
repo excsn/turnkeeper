@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [1.2.8] - 2025-11-25
+
+### Fixed
+- Resolved a critical "Zero-Sleep Deadlock" where the coordinator would sleep indefinitely if a job became ready exactly at the moment of calculation (returning 0ms duration), effectively ignoring the ready job.
+- Implemented a 50ms backoff mechanism in the sleep calculation when workers are at capacity to prevent high CPU usage (hot loops) while maintaining immediate responsiveness via channel signals.
+- Added 5ms jitter tolerance to job dispatching to handle premature OS timer wake-ups, preventing unnecessary loop cycles and improving scheduling consistency.
+
 ## [1.2.7] - 2025-11-22
 
 ### Changed

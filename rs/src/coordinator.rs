@@ -288,7 +288,7 @@ impl Coordinator {
             }
           }
         },
-        _ = async { sleep(sleep_duration).await }, if self.shutting_down != Some(ShutdownMode::Force) && sleep_duration > Duration::ZERO => {
+        _ = async { sleep(sleep_duration).await }, if self.shutting_down != Some(ShutdownMode::Force) => {
           trace!("Timer fired.");
           if self.shutting_down != Some(ShutdownMode::Graceful) {
             self.try_dispatch_jobs().await;
@@ -815,7 +815,7 @@ impl Coordinator {
         if let crate::job::Schedule::Once(_) = def.request.schedule {
           def.request.schedule = crate::job::Schedule::Once(trigger_time);
         }
-        
+
         // Reset retry count for manual runs
         if matches!(
           def.request.schedule,
@@ -866,7 +866,10 @@ impl Coordinator {
       let maybe_next_job = self.pq.peek().await;
 
       if let Some((next_run_dt, _instance_id)) = maybe_next_job {
-        if next_run_dt <= now {
+        // If the OS wakes us up 0.001ms early, treat it as "now" to avoid looping. Add 5ms jitter tolerance.
+        let now_with_tolerance = now + chrono::Duration::milliseconds(5);
+
+        if next_run_dt <= now_with_tolerance {
           // Job is ready or overdue. Now try to pop and process.
 
           // Pop BEFORE checking cancellation/dispatching
@@ -1027,6 +1030,16 @@ impl Coordinator {
         }
       } else {
         // Job is ready or overdue
+
+        // If workers are full, back off to prevent hot loop.
+        let active = self.state.active_workers_counter.load(AtomicOrdering::Relaxed);
+        if active >= self.state.max_workers {
+          let backoff = Duration::from_millis(50);
+          trace!("Next job ready but workers full. Backing off 50ms.");
+          self.next_wakeup_timer = Some(tokio::time::Instant::now() + backoff);
+          return backoff;
+        }
+
         trace!("Next job ready now, setting zero sleep.");
         self.next_wakeup_timer = Some(tokio::time::Instant::now());
         return Duration::ZERO;
