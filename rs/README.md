@@ -8,6 +8,10 @@ TurnKeeper is a flexible, asynchronous recurring job scheduler for Rust built on
 
 It uses a central coordinator task and a configurable pool of worker tasks, communicating via efficient asynchronous channels.
 
+## Notable Users
+
+[Hi Stakes Markets Game](https://www.histakesgame.com) -  The worlds most advanced financial simulator, available on iPhone and Android.
+
 ## Features
 
 *   **Flexible Scheduling:** Schedule jobs using:

@@ -67,3 +67,7 @@ While borrowing concepts from existing systems, TurnKeeper differentiates itself
 *   **Focus on in-process execution** for tighter application integration and simpler deployment compared to OS schedulers or distributed queues, but with significantly more resilience and features than basic timer loops.
 
 TurnKeeper strives to provide a robust "turn-key" solution (pun intended!) for managing scheduled tasks reliably within your asynchronous application.
+
+## Notable Users
+
+[Hi Stakes Markets Game](https://www.histakesgame.com) -  The worlds most advanced financial simulator, available on iPhone and Android.
