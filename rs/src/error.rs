@@ -42,9 +42,6 @@ impl fmt::Debug for SubmitError<(TKJobRequest, Arc<BoxedExecFn>)> {
   }
 }
 
-// --- Manual From implementations for channel errors ---
-// These allow easily converting errors from tokio::mpsc::[try_]send into SubmitError
-
 impl<T> From<TrySendError<T>> for SubmitError<T> {
   fn from(err: TrySendError<T>) -> Self {
     match err {

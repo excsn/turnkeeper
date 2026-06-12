@@ -207,3 +207,74 @@ async fn test_trigger_job_interacts_with_schedule() {
 
   scheduler.shutdown_graceful(None).await.unwrap();
 }
+
+/// Verifies that a manual-only `Schedule::Never` job remains active after running,
+/// allowing it to be triggered multiple times cleanly.
+#[tokio::test]
+async fn test_never_job_triggered_multiple_times() {
+  setup_tracing();
+  let scheduler = build_scheduler(1, PriorityQueueType::HandleBased).unwrap();
+  let counter = Arc::new(AtomicUsize::new(0));
+
+  let req = TKJobRequest::never("Persistent Utility", 0);
+  let job_id = scheduler
+    .add_job_async(
+      req,
+      crate::common::job_exec_counter_result(counter.clone(), StdDuration::ZERO, true),
+    )
+    .await
+    .unwrap();
+
+  tokio::time::sleep(StdDuration::from_millis(50)).await;
+
+  // 1. First manual trigger
+  scheduler.trigger_job_now(job_id).await.unwrap();
+  tokio::time::sleep(StdDuration::from_millis(200)).await;
+  assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+  // Verify the job definition is still alive in the active registry
+  let details = scheduler.get_job_details(job_id).await.unwrap();
+  assert!(!details.is_cancelled);
+  assert!(details.next_run_time.is_none());
+
+  // 2. Second manual trigger
+  scheduler.trigger_job_now(job_id).await.unwrap();
+  tokio::time::sleep(StdDuration::from_millis(200)).await;
+  assert_eq!(
+    counter.load(Ordering::SeqCst),
+    2,
+    "Never job should be triggerable multiple times"
+  );
+
+  scheduler.shutdown_graceful(None).await.unwrap();
+}
+
+/// Sanity Check: Verifies that standard `Schedule::Once` jobs retain their original
+/// behavior and are still automatically archived and deleted upon completion.
+#[tokio::test]
+async fn test_once_job_retains_automatic_archiving() {
+  setup_tracing();
+  let scheduler = build_scheduler(1, PriorityQueueType::BinaryHeap).unwrap();
+  let flag = Arc::new(AtomicBool::new(false));
+
+  let run_time = Utc::now() + ChronoDuration::milliseconds(100);
+  let req = TKJobRequest::from_once("Sanity Once", run_time, 0);
+
+  let job_id = scheduler
+    .add_job_async(req, job_exec_flag(flag.clone(), StdDuration::ZERO))
+    .await
+    .unwrap();
+
+  tokio::time::sleep(StdDuration::from_millis(500)).await; // Wait for execution
+
+  assert!(flag.load(Ordering::SeqCst));
+
+  // A Completed `Once` job should be automatically archived on completion, so triggering it now should return JobNotFound
+  let trigger_res = scheduler.trigger_job_now(job_id).await;
+  assert!(
+    matches!(trigger_res, Err(QueryError::JobNotFound(id)) if id == job_id),
+    "Once job should still be automatically archived and untriggerable"
+  );
+
+  scheduler.shutdown_graceful(None).await.unwrap();
+}

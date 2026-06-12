@@ -483,6 +483,10 @@ impl Coordinator {
         let result = self.handle_trigger_job_now(job_id).await;
         let _ = responder.send(result);
       }
+      CoordinatorCommand::DeleteJob { job_id, responder } => {
+        let result = self.handle_delete_job_internal(job_id).await;
+        let _ = responder.send(result);
+      }
     } // end match cmd
   }
 
@@ -571,23 +575,32 @@ impl Coordinator {
         debug!(%lineage_id, failed = is_permanent_failure, "Job lineage complete (no more runs scheduled).");
         self.cleanup_instance_maps(completed_instance_id, lineage_id).await;
 
-        // CHANGED: Move from Map -> History Cache
         let mut completed_def_opt = None;
         {
-          // Write lock to remove
           let mut definitions = self.state.job_definitions.write();
-          if let Some(mut def) = definitions.remove(&lineage_id) {
-            // Clean up state before archiving
-            def.current_instance_id = None;
-            def.request.next_run = None;
-            def.request.retry_count = 0;
-            completed_def_opt = Some(def);
+
+          let is_never_schedule = definitions
+            .get(&lineage_id)
+            .map_or(false, |def| def.request.schedule == crate::job::Schedule::Never);
+
+          if is_never_schedule {
+            // Keep Never-scheduled jobs alive so they can be manually triggered again.
+            if let Some(def) = definitions.get_mut(&lineage_id) {
+              def.current_instance_id = None;
+              def.request.next_run = None;
+              def.request.retry_count = 0;
+            }
+          } else {
+            if let Some(mut def) = definitions.remove(&lineage_id) {
+              def.current_instance_id = None;
+              def.request.next_run = None;
+              def.request.retry_count = 0;
+              completed_def_opt = Some(def);
+            }
           }
         }
 
         if let Some(def) = completed_def_opt {
-          // Insert into history with cost 1
-          // TTL is handled by the cache configuration
           self.state.job_history.insert(lineage_id, def, 1);
           debug!(%lineage_id, "Moved completed job to history cache.");
         }
@@ -1153,6 +1166,39 @@ impl Coordinator {
       next_run_instance: def.current_instance_id,
       next_run_time: def.request.next_run,
       is_cancelled,
+    }
+  }
+
+  async fn handle_delete_job_internal(&mut self, job_id: TKJobId) -> Result<(), QueryError> {
+    let mut instance_id_to_remove_opt = None;
+
+    let removed_def_opt = {
+      let mut definitions = self.state.job_definitions.write();
+      if let Some(mut def) = definitions.remove(&job_id) {
+        instance_id_to_remove_opt = def.current_instance_id.take();
+        Some(def)
+      } else {
+        None
+      }
+    };
+
+    if let Some(def) = removed_def_opt {
+      if let Some(instance_id) = instance_id_to_remove_opt {
+        self.state.instance_to_lineage.write().remove(&instance_id);
+        if self.state.pq_type == PriorityQueueType::HandleBased {
+          self.pq.remove(&instance_id).await;
+        }
+      }
+
+      self.state.cancellations.write().remove(&job_id);
+      self.state.quarantined_jobs.write().remove(&job_id);
+
+      self.state.job_history.insert(job_id, def, 1);
+      debug!(%job_id, "Explicitly deleted job from active definitions and archived it.");
+      self.try_wake_timer();
+      Ok(())
+    } else {
+      Err(QueryError::JobNotFound(job_id))
     }
   }
 

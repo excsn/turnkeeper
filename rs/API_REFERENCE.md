@@ -73,6 +73,12 @@ See [`SchedulerBuilder`](#schedulerbuilder) for all configuration options.
         *   [`QueryError::TriggerFailedJobCancelled`]: Returned if the job is marked as cancelled.
         *   [`QueryError::JobNotFound`], [`QueryError::SchedulerShutdown`], [`QueryError::ResponseFailed`].
 
+*   `async fn delete_job(&self, job_id: TKJobId) -> Result<(), QueryError>`
+    *   Explicitly removes a job lineage from active definitions and moves it to the history cache.
+    *   Intended for garbage-collecting `Schedule::Never` jobs that are no longer needed (they persist in active state after each run until deleted).
+    *   Cleans up any pending instance from the priority queue and clears cancellation/quarantine state for the job.
+    *   **Errors:** [`QueryError::SchedulerShutdown`], [`QueryError::ResponseFailed`], [`QueryError::JobNotFound`]
+
 *   `async fn get_job_details(&self, job_id: TKJobId) -> Result<JobDetails, QueryError>`
     *   Retrieves detailed information about a specific job lineage.
     *   **History:** Includes jobs that have **completed** or **failed permanently**. These are retained in an internal history cache (default TTL: 1 hour) after execution finishes.

@@ -13,7 +13,7 @@ use std::sync::{
 use std::time::Duration as StdDuration;
 use turnkeeper::{
   QueryError,
-  job::{Schedule, TKJobRequest},
+  job::TKJobRequest,
   scheduler::PriorityQueueType,
 };
 

@@ -66,7 +66,7 @@ impl Schedule {
   pub(crate) fn calculate_next_run(&self, reference_time: DateTime<Utc>) -> Option<DateTime<Utc>> {
     match self {
       Schedule::WeekdayTimes(times) => {
-        calculate_next_weekday_time(times, reference_time) // Use helper
+        calculate_next_weekday_time(times, reference_time)
       }
       #[cfg(feature = "cron_schedule")]
       Schedule::Cron(expression) => match CronSchedule::from_str(expression) {
@@ -212,8 +212,6 @@ pub struct TKJobRequest {
   pub(crate) next_run: Option<DateTime<Utc>>,
 }
 
-// Manual implementation of Debug to avoid requiring Debug constraint on BoxedExecFn
-// which might be captured in closures.
 impl fmt::Debug for TKJobRequest {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.debug_struct("TKJobRequest")

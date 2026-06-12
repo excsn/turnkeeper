@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [1.2.9] - 2026-06-11
+
+### Added
+- `TurnKeeper::delete_job` — explicitly removes a job lineage from active definitions and archives it to history.
+- `Schedule::Never` jobs are no longer auto-archived after completion; they remain active and re-triggerable until explicitly deleted.
+
 ## [1.2.8] - 2025-11-25
 
 ### Fixed

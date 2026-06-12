@@ -537,6 +537,22 @@ impl TurnKeeper {
     response_rx.recv().await.map_err(|_| QueryError::ResponseFailed)? // Unpack inner Result
   }
 
+  /// Explicitly deletes a job lineage from active definitions and moves it to history.
+  ///
+  /// Useful for manually garbage-collecting `Never`-scheduled jobs that are no longer needed.
+  ///
+  /// # Errors
+  ///
+  /// - [`QueryError::SchedulerShutdown`]: Scheduler is not running.
+  /// - [`QueryError::ResponseFailed`]: Coordinator failed to respond.
+  /// - [`QueryError::JobNotFound`]: No job with the given ID exists.
+  pub async fn delete_job(&self, job_id: TKJobId) -> Result<(), QueryError> {
+    let (responder, response_rx) = oneshot();
+    let cmd = CoordinatorCommand::DeleteJob { job_id, responder };
+    self.cmd_tx.send(cmd).await.map_err(|_| QueryError::SchedulerShutdown)?;
+    response_rx.recv().await.map_err(|_| QueryError::ResponseFailed)?
+  }
+
   /// Initiates a graceful shutdown.
   ///
   /// Signals the scheduler to stop accepting new jobs and wait for currently

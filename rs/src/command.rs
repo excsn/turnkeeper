@@ -60,6 +60,12 @@ pub(crate) enum CoordinatorCommand {
     job_id: TKJobId,
     responder: oneshot::Sender<Result<(), QueryError>>, // Ok if scheduled, Err if not found/running etc.
   },
+  /// Request complete deletion of a job definition from memory.
+  DeleteJob {
+    job_id: TKJobId,
+    /// Channel to send the `Result<(), QueryError>` back.
+    responder: oneshot::Sender<Result<(), QueryError>>,
+  },
 }
 
 /// Represents the requested shutdown mode. Sent via a `watch` channel.

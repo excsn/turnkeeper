@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   match scheduler.add_job_async(job_req, job_fn).await {
     Ok(job_id) => info!("Job submitted with ID: {}", job_id),
     Err(e) => {
-      error!("Failed to submit job: {:?}", e); // Use manual debug for SubmitError
+      error!("Failed to submit job: {:?}", e);
       match e {
         turnkeeper::error::SubmitError::StagingFull(_) => error!("Staging full"),
         turnkeeper::error::SubmitError::ChannelClosed(_) => error!("Channel closed"),
