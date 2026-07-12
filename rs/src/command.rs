@@ -1,10 +1,8 @@
 use crate::error::QueryError;
 use crate::job::{InstanceId, JobDetails, JobSummary, MaxRetries, Schedule, TKJobId};
-use crate::metrics::MetricsSnapshot;
 
 use chrono::{DateTime, Utc};
 use fibre::oneshot;
-use tokio::task::JoinHandle;
 
 /// Data required to update a job's configuration.
 /// Fields are optional; `None` indicates no change for that field.
@@ -33,11 +31,6 @@ pub(crate) enum CoordinatorCommand {
     // Consider adding pagination/filtering options in the future
     /// Channel to send the `Vec<JobSummary>` back.
     responder: oneshot::Sender<Vec<JobSummary>>, // Response is always success unless channel fails
-  },
-  /// Request a snapshot of the current scheduler metrics.
-  GetMetricsSnapshot {
-    /// Channel to send the `MetricsSnapshot` back.
-    responder: oneshot::Sender<MetricsSnapshot>, // Response is always success unless channel fails
   },
   /// Request cancellation of a specific job lineage.
   CancelJob {

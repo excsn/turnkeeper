@@ -35,11 +35,13 @@ async fn run_cancellation_test(pq_type: PriorityQueueType) {
     .await
     .expect("Cancel request failed");
 
-  // Verify cancelled state immediately (best effort check)
+  // Cancellation is per-run: the lineage is NOT marked cancelled; only the pending run
+  // is skipped. With a `Never` schedule there is no next occurrence, so nothing remains
+  // scheduled.
   let details_after_cancel = scheduler.get_job_details(job_id).await.unwrap();
   assert!(
-    details_after_cancel.is_cancelled,
-    "Job should be marked cancelled immediately"
+    !details_after_cancel.is_cancelled,
+    "Per-run cancellation must not mark the lineage as cancelled"
   );
   if pq_type == PriorityQueueType::HandleBased {
     // With HandleBased, the next_run_instance should ideally be cleared quickly
@@ -59,14 +61,11 @@ async fn run_cancellation_test(pq_type: PriorityQueueType) {
   // Check metrics
   let metrics = scheduler.get_metrics_snapshot().await.unwrap();
   assert_eq!(metrics.jobs_executed_success, 0);
-  assert_eq!(metrics.jobs_lineage_cancelled, 1); // Lineage marked cancelled
-                                                 // Instance discarded metric should be 1 (if coordinator processed it) or 0 (if cancelled before pop)
-                                                 // This metric might be slightly harder to assert reliably without more timing control.
-                                                 // assert_eq!(metrics.jobs_instance_discarded_cancelled, 1);
+  assert_eq!(metrics.jobs_lineage_cancelled, 1); // One pending run cancelled
 
-  // Check final state
+  // Check final state: lineage still registered (cancel is not delete), nothing scheduled.
   let details_final = scheduler.get_job_details(job_id).await.unwrap();
-  assert!(details_final.is_cancelled);
+  assert!(!details_final.is_cancelled);
   assert!(
     details_final.next_run_instance.is_none(),
     "Instance ID should be None finally"

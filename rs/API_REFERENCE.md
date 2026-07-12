@@ -53,8 +53,10 @@ See [`SchedulerBuilder`](#schedulerbuilder) for all configuration options.
     *   **Errors:** [`SubmitError::ChannelClosed`] - Contains the original `(request, exec_fn)` tuple.
 
 *   `async fn cancel_job(&self, job_id: TKJobId) -> Result<(), QueryError>`
-    *   Requests cancellation of a job lineage. Operation is idempotent.
-    *   Effect depends on [`PriorityQueueType`] used during build (`HandleBased` attempts proactive removal).
+    *   Requests cancellation of the job's **pending run** (the currently scheduled instance). Operation is idempotent.
+    *   **Cancel is not delete.** Cancelling does not remove the lineage: the job definition stays registered and queryable. For a **recurring** schedule the lineage continues — the next occurrence still runs; only the cancelled run is skipped. Use [`delete_job`] to remove a lineage entirely.
+    *   For `Once` / `Never` schedules there is no next occurrence; the record persists in active state until reclaimed with [`delete_job`].
+    *   Removal of the queued instance depends on [`PriorityQueueType`] used during build (`HandleBased` attempts proactive removal; `BinaryHeap` discards lazily when the instance surfaces).
     *   **Errors:** [`QueryError::SchedulerShutdown`], [`QueryError::ResponseFailed`], [`QueryError::JobNotFound`]
 
 *   `async fn update_job(&self, job_id: TKJobId, schedule: Option<Schedule>, max_retries: Option<MaxRetries>) -> Result<(), QueryError>`
@@ -74,9 +76,12 @@ See [`SchedulerBuilder`](#schedulerbuilder) for all configuration options.
         *   [`QueryError::JobNotFound`], [`QueryError::SchedulerShutdown`], [`QueryError::ResponseFailed`].
 
 *   `async fn delete_job(&self, job_id: TKJobId) -> Result<(), QueryError>`
-    *   Explicitly removes a job lineage from active definitions and moves it to the history cache.
-    *   Intended for garbage-collecting `Schedule::Never` jobs that are no longer needed (they persist in active state after each run until deleted).
-    *   Cleans up any pending instance from the priority queue and clears cancellation/quarantine state for the job.
+    *   **The lineage-removal operation.** Explicitly removes a job lineage from active definitions and moves it to the history cache. This is the only API that removes a lineage — `cancel_job` only cancels a pending run.
+    *   Use it to garbage-collect any lineage that persists in active state until deleted:
+        *   **quarantined** lineages (a job that panicked is quarantined and retained for inspection),
+        *   `Once` / `Never` lineages with no further occurrence (they persist after running, or after their pending run is cancelled, until deleted).
+    *   **This is the only way memory for those records is reclaimed.** Long-running deployments whose jobs can panic must eventually `delete_job` the quarantined lineages — retained records accumulate until deleted.
+    *   Cleans up any pending instance from the priority queue and clears cancellation/quarantine state for the job. The archived record remains queryable via `get_job_details` / `list_all_jobs` until it expires from the history cache (default TTL: 1 hour).
     *   **Errors:** [`QueryError::SchedulerShutdown`], [`QueryError::ResponseFailed`], [`QueryError::JobNotFound`]
 
 *   `async fn get_job_details(&self, job_id: TKJobId) -> Result<JobDetails, QueryError>`

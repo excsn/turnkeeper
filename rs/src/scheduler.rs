@@ -439,27 +439,29 @@ impl TurnKeeper {
 
   /// Retrieves a snapshot of the current scheduler metrics.
   ///
-  /// # Errors
+  /// The snapshot is computed directly from the shared metric atomics owned by this
+  /// handle — no coordinator round-trip — so it never blocks behind job processing and
+  /// remains available even after the scheduler has shut down. Gauge values reflect the
+  /// coordinator's most recent update and may lag by one loop iteration.
   ///
-  /// - [`QueryError::SchedulerShutdown`]: Scheduler is not running.
-  /// - [`QueryError::ResponseFailed`]: Coordinator failed to respond.
+  /// This method is infallible; the `Result` is kept for API compatibility.
   pub async fn get_metrics_snapshot(&self) -> Result<MetricsSnapshot, QueryError> {
-    let (responder, response_rx) = oneshot();
-    let cmd = CoordinatorCommand::GetMetricsSnapshot { responder };
-    self.cmd_tx.send(cmd).await.map_err(|_| QueryError::SchedulerShutdown)?;
-    response_rx.recv().await.map_err(|_| QueryError::ResponseFailed)
+    Ok(self.metrics.snapshot())
   }
 
-  /// Requests cancellation of a job lineage.
+  /// Requests cancellation of the job's **pending run**.
   ///
-  /// Depending on the `PriorityQueueType` used:
-  /// - `BinaryHeap`: Marks the job. It will be discarded when it reaches the front.
-  /// - `HandleBased`: Attempts to proactively remove the job from the queue.
+  /// Cancellation is per-run, not per-lineage: the job definition stays registered. For a
+  /// **recurring** schedule the next occurrence is scheduled immediately, so the job keeps
+  /// running on its schedule — only the pending run is skipped. For `Once` / `Never`
+  /// schedules there is no next occurrence; the record persists until [`TurnKeeper::delete_job`].
   ///
-  /// This operation is idempotent. Requesting cancellation for an already cancelled
-  /// or non-existent job will succeed without error (unless the job ID never existed).
+  /// Removal of the queued instance depends on the `PriorityQueueType` used:
+  /// - `BinaryHeap`: The pending instance is invalidated and discarded when it surfaces.
+  /// - `HandleBased`: The pending instance is proactively removed from the queue.
   ///
-  /// Does not guarantee that a job instance currently executing will be stopped.
+  /// Does not stop a job instance that is currently executing; if no run is pending, the
+  /// call is a no-op and succeeds.
   ///
   /// # Errors
   ///

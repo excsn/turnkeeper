@@ -159,15 +159,18 @@ async fn test_update_job_not_found() {
   scheduler.shutdown_graceful(None).await.unwrap();
 }
 
+/// Cancellation is per-run: after the pending run of a `Once` job is cancelled, the
+/// lineage remains registered and an `update_job` with a new schedule reschedules it
+/// normally.
 #[tokio::test]
-async fn test_update_cancelled_job() {
+async fn test_update_after_cancel_reschedules() {
   setup_tracing();
   let scheduler = build_scheduler(1, PriorityQueueType::HandleBased).unwrap();
   let flag = Arc::new(AtomicBool::new(false));
 
   // 1. Add job scheduled far out
   let initial_schedule = Schedule::Once(Utc::now() + ChronoDuration::days(1));
-  let job_req = TKJobRequest::new("Update Cancelled", initial_schedule.clone(), 0);
+  let job_req = TKJobRequest::new("Update After Cancel", initial_schedule.clone(), 0);
   let job_id = scheduler
     .add_job_async(job_req, job_exec_flag(flag.clone(), StdDuration::ZERO))
     .await
@@ -175,40 +178,33 @@ async fn test_update_cancelled_job() {
 
   tokio::time::sleep(StdDuration::from_millis(50)).await;
 
-  // 2. Cancel the job
+  // 2. Cancel the pending run (Once has no next occurrence, so nothing stays scheduled)
   scheduler.cancel_job(job_id).await.expect("Cancel failed");
   tokio::time::sleep(StdDuration::from_millis(50)).await; // Allow cancel processing
 
-  // 3. Update the cancelled job's schedule
-  let new_schedule = Schedule::Once(Utc::now() + ChronoDuration::milliseconds(100));
-  let update_result = scheduler
-    .update_job(job_id, Some(new_schedule.clone()), None)
-    .await;
-
-  // Update itself should succeed as the definition exists
-  assert!(
-    update_result.is_ok(),
-    "Update call should succeed even if cancelled"
-  );
-
-  // 4. Verify details: schedule updated, but still cancelled and not scheduled
   let details = scheduler.get_job_details(job_id).await.unwrap();
-  assert!(details.is_cancelled, "Job should remain cancelled");
+  assert!(!details.is_cancelled, "Per-run cancel must not mark the lineage");
+  assert!(details.next_run_time.is_none(), "Cancelled Once run leaves nothing scheduled");
+
+  // 3. Update the schedule — the lineage is alive, so this reschedules it
+  let new_schedule = Schedule::Once(Utc::now() + ChronoDuration::milliseconds(100));
+  scheduler
+    .update_job(job_id, Some(new_schedule.clone()), None)
+    .await
+    .expect("Update after per-run cancel should succeed");
+
+  let details = scheduler.get_job_details(job_id).await.unwrap();
   assert_eq!(details.schedule, new_schedule, "Schedule should be updated");
   assert!(
-    details.next_run_time.is_none(),
-    "Cancelled job should not be scheduled"
-  );
-  assert!(
-    details.next_run_instance.is_none(),
-    "Cancelled job should have no instance"
+    details.next_run_time.is_some(),
+    "Updated job should be scheduled again"
   );
 
-  // 5. Wait past new "scheduled" time and verify it didn't run
+  // 4. Wait past the new scheduled time and verify it ran
   tokio::time::sleep(StdDuration::from_millis(500)).await;
   assert!(
-    !flag.load(Ordering::SeqCst),
-    "Cancelled job should not run after update"
+    flag.load(Ordering::SeqCst),
+    "Job should run after update rescheduled it"
   );
 
   scheduler.shutdown_graceful(None).await.unwrap();

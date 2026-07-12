@@ -17,6 +17,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [1.2.10] - 2026-07-11
+
+### Changed
+- `cancel_job` is now per-run: it cancels only the pending run; recurring jobs continue on their schedule. Use `delete_job` to remove a lineage.
+- `is_cancelled` in `JobDetails`/`JobSummary` now reports only halted (quarantined) lineages.
+- Quarantine no longer increments `jobs_lineage_cancelled`; the metric now counts cancelled pending runs.
+- `get_metrics_snapshot` reads handle-owned metrics directly (no coordinator round-trip) and works after shutdown.
+
+### Fixed
+- Worker supervision silently detached all worker handles on the first coordinator event, disabling respawn and shutdown joins. Supervision now uses a persistent `FuturesUnordered`.
+
 ## [1.2.9] - 2026-06-11
 
 ### Added

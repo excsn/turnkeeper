@@ -1,6 +1,8 @@
 //! examples/cancel_recurring.rs
 //!
-//! Demonstrates cancelling a recurring job after it has run at least once.
+//! Demonstrates per-run cancellation on a recurring job: `cancel_job` skips the pending
+//! occurrence while the lineage keeps running on its schedule, and `delete_job` is the
+//! operation that actually stops and removes the lineage.
 
 use chrono::{Duration as ChronoDuration, Utc};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -81,43 +83,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   info!("Execution count after first wait: {}", count_after_first);
   assert!(count_after_first >= 1, "Job should have run at least once");
 
-  // --- Cancel the Job ---
-  info!("Requesting cancellation for job {}...", job_id);
+  // --- Cancel the pending run ---
+  // Per-run cancellation: only the currently pending occurrence is skipped. The lineage
+  // stays registered and the occurrence *after* the skipped one is scheduled immediately.
+  info!("Requesting cancellation of the pending run for job {}...", job_id);
   match scheduler.cancel_job(job_id).await {
-    Ok(()) => info!("Cancellation requested successfully."),
-    Err(e) => error!("Failed to cancel job {}: {:?}", job_id, e),
+    Ok(()) => info!("Pending run cancelled."),
+    Err(e) => error!("Failed to cancel pending run for {}: {:?}", job_id, e),
   }
 
-  // --- Wait to ensure it doesn't run again ---
-  info!("Waiting longer (5 seconds) to ensure cancellation takes effect...");
-  tokio::time::sleep(StdDuration::from_secs(5)).await;
+  let details = scheduler.get_job_details(job_id).await.unwrap();
+  info!("Details after cancel: {:#?}", details);
+  assert!(!details.is_cancelled, "Per-run cancel does not mark the lineage");
+  assert!(
+    details.next_run_time.is_some(),
+    "Recurring lineage continues: the next occurrence is scheduled"
+  );
 
-  // --- Check Final State ---
+  // --- Show the lineage keeps running ---
+  info!("Waiting ~2 intervals to show the recurring job continues after the skipped run...");
+  tokio::time::sleep(StdDuration::from_millis(4500)).await;
+  let count_after_cancel_wait = execution_count.load(Ordering::Relaxed);
+  info!("Execution count after cancel + wait: {}", count_after_cancel_wait);
+  assert!(
+    count_after_cancel_wait > count_after_first,
+    "Recurring job should keep running after a per-run cancel"
+  );
+
+  // --- Stop the job for real: delete it ---
+  info!("Deleting job {} to stop and remove the lineage...", job_id);
+  scheduler.delete_job(job_id).await.expect("delete_job failed");
+
+  tokio::time::sleep(StdDuration::from_secs(3)).await;
   let final_count = execution_count.load(Ordering::Relaxed);
   info!("Final execution count: {}", final_count);
   assert_eq!(
-    final_count,
-    count_after_first, // Count should not have increased after cancel
-    "Job ran again after being cancelled!"
-  );
-
-  info!("Querying final job details...");
-  let details = scheduler.get_job_details(job_id).await.unwrap();
-  info!("Final Details: {:#?}", details);
-  assert!(details.is_cancelled, "Job should be marked as cancelled");
-  assert!(
-    details.next_run_time.is_none(),
-    "Cancelled job should have no next run time"
-  );
-  assert!(
-    details.next_run_instance.is_none(),
-    "Cancelled job should have no next run instance"
+    final_count, count_after_cancel_wait,
+    "Job must not run again after delete_job"
   );
 
   let metrics = scheduler.get_metrics_snapshot().await.unwrap();
   info!("Final Metrics: {:#?}", metrics);
-  assert_eq!(metrics.jobs_executed_success, count_after_first);
-  assert_eq!(metrics.jobs_lineage_cancelled, 1);
+  assert_eq!(metrics.jobs_lineage_cancelled, 1); // One pending run was cancelled
 
   // --- Shutdown ---
   info!("Requesting graceful shutdown...");

@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use fibre::mpmc;
 use fibre::{mpmc::AsyncSender, mpsc};
 use fibre_cache::Cache;
-use futures::future::select_all;
+use futures::stream::{FuturesUnordered, StreamExt};
 use parking_lot::{Mutex, RwLock};
 use priority_queue::priority_queue::PriorityQueue;
 use tokio::sync::watch;
@@ -181,7 +181,15 @@ impl Coordinator {
   pub async fn run(&mut self) {
     info!("Coordinator started.");
 
-    let mut worker_handles = std::mem::take(&mut self.state.worker_handles);
+    // Persistent supervision structure: worker JoinHandles live in this FuturesUnordered
+    // for the coordinator's lifetime. Polling it inside `select!` is safe — a losing
+    // iteration drops only the lightweight `next()` future, never the handles. (Never
+    // rebuild a `select_all(handles.drain(..))` per iteration: `select_all` collects
+    // eagerly, so the handles get drained on first poll and detached when another branch
+    // wins.)
+    let mut worker_tasks: FuturesUnordered<JoinHandle<()>> =
+      std::mem::take(&mut self.state.worker_handles).into_iter().collect();
+    let mut next_worker_id = self.state.max_workers;
 
     loop {
       // Update gauge metrics
@@ -209,27 +217,15 @@ impl Coordinator {
       tokio::select! {
         biased;
 
-        // --- BRANCH 1: Supervisor Check (only active if there are workers) ---
-        Some((result, index, remaining)) = async {
-          if worker_handles.is_empty() {
-            // This future will pend forever if there are no handles,
-            // effectively disabling this select branch.
-            std::future::pending().await
-          } else {
-            // select_all consumes the handles, so we drain them.
-            let (res, idx, rem) = select_all(worker_handles.drain(..)).await;
-            // Return Some, which will be matched by the pattern
-            Some((res, idx, rem))
-          }
-        } => {
-            // A worker terminated. Restore the remaining handles.
-            worker_handles = remaining;
-
+        // --- BRANCH 1: Supervisor Check ---
+        // `next()` yields `None` when the set is empty, which fails the `Some` pattern
+        // and simply disables this branch for the iteration.
+        Some(join_result) = worker_tasks.next() => {
             if self.shutting_down.is_some() {
-              trace!(worker_index = index, "Supervised worker terminated during planned shutdown.");
+              trace!("Supervised worker terminated during planned shutdown.");
             } else {
-              error!(worker_index = index, "Worker terminated unexpectedly! Respawning...");
-              if let Err(join_error) = result {
+              error!("Worker terminated unexpectedly! Respawning...");
+              if let Err(join_error) = join_result {
                 if join_error.is_panic() {
                   let panic_payload = join_error.into_panic();
                   let panic_info = panic_payload
@@ -237,11 +233,12 @@ impl Coordinator {
                     .map(|s| *s)
                     .or_else(|| panic_payload.downcast_ref::<String>().map(|s| s.as_str()))
                     .unwrap_or("Unknown panic payload");
-                  error!(worker_index = index, panic_info, "Panic payload from terminated worker.");
+                  error!(panic_info, "Panic payload from terminated worker.");
                 }
               }
-              let new_handle = self.spawn_worker(index);
-              worker_handles.push(new_handle);
+              let new_handle = self.spawn_worker(next_worker_id);
+              next_worker_id += 1;
+              worker_tasks.push(new_handle);
             }
         },
 
@@ -300,18 +297,14 @@ impl Coordinator {
     info!("Coordinator main loop finished. Awaiting worker task termination...");
     let _ = self.state.job_dispatch_tx.close(); // Ensure workers wake up and see closed channel
 
-    // Wait for all worker tasks to finish.
-    for (i, handle) in worker_handles.into_iter().enumerate() {
-      if let Err(e) = handle.await {
-        error!(
-          worker_id = i,
-          "Worker task panicked during final shutdown join: {:?}", e
-        );
+    // Join all remaining worker tasks.
+    while let Some(join_result) = worker_tasks.next().await {
+      if let Err(e) = join_result {
+        error!("Worker task panicked during final shutdown join: {:?}", e);
       }
     }
 
     info!("Coordinator task shutting down.");
-    let _ = self.state.job_dispatch_tx.close();
   }
 
   /// Spawns a new worker task and returns its JoinHandle.
@@ -462,10 +455,6 @@ impl Coordinator {
         }
 
         let _ = responder.send(summaries);
-      }
-      CoordinatorCommand::GetMetricsSnapshot { responder } => {
-        let snapshot = self.state.metrics.snapshot();
-        let _ = responder.send(snapshot);
       }
       CoordinatorCommand::CancelJob { job_id, responder } => {
         let response = self.handle_cancel_job_internal(job_id).await;
@@ -633,16 +622,28 @@ impl Coordinator {
           "Worker reported a panic. Quarantining job lineage."
         );
 
-        // Add to the quarantine list.
+        // Quarantine is a lineage-level stop, independent of per-run cancellation: the
+        // job is held for inspection and will not be scheduled again until it is
+        // explicitly deleted (`delete_job` clears quarantine state).
         self.state.quarantined_jobs.write().insert(lineage_id);
 
         // Clean up the instance that just ran (and panicked).
         self.cleanup_instance_maps(completed_instance_id, lineage_id).await;
 
-        // Reuse the cancellation logic to mark the job as 'cancelled'
-        // and remove it from the priority queue. This effectively disables it.
-        if let Err(e) = self.handle_cancel_job_internal(lineage_id).await {
-          error!(%lineage_id, error = ?e, "Failed to perform cleanup after quarantining job.");
+        // Halt the lineage: clear pending state and remove any queued instance
+        // (defensive; normally the panicked instance was the current one).
+        let pending_instance_opt = {
+          let mut definitions = self.state.job_definitions.write();
+          definitions.get_mut(&lineage_id).map(|def| {
+            def.request.next_run = None;
+            def.current_instance_id.take()
+          })
+        };
+        if let Some(Some(pending_instance)) = pending_instance_opt {
+          self.state.instance_to_lineage.write().remove(&pending_instance);
+          if self.state.pq_type == PriorityQueueType::HandleBased {
+            self.pq.remove(&pending_instance).await;
+          }
         }
       }
     }
@@ -689,14 +690,10 @@ impl Coordinator {
 
     debug!(%job_id, "Rescheduling job due to update.");
 
-    // CHANGE: Check cancellation before scheduling anything
-    let is_cancelled = {
-      let cancels = self.state.cancellations.read();
-      cancels.contains(&job_id)
-    };
-    if is_cancelled {
-      // Job is cancelled: do NOT enqueue a new instance
-      debug!(%job_id, "Job is cancelled—skipping reschedule.");
+    // Quarantined lineages are halted: do NOT enqueue a new instance.
+    let is_quarantined = { self.state.quarantined_jobs.read().contains(&job_id) };
+    if is_quarantined {
+      debug!(%job_id, "Job is quarantined—skipping reschedule.");
       return Ok(());
     }
 
@@ -753,12 +750,11 @@ impl Coordinator {
       let definitions = self.state.job_definitions.read();
       let def = definitions.get(&job_id).ok_or(QueryError::JobNotFound(job_id))?;
 
-      // Check cancellation
-      let cancellations = self.state.cancellations.read();
-      if cancellations.contains(&job_id) {
+      // Quarantined lineages are halted for inspection and must not be triggered.
+      // (Reported via the existing `TriggerFailedJobCancelled` variant.)
+      if self.state.quarantined_jobs.read().contains(&job_id) {
         return Err(QueryError::TriggerFailedJobCancelled(job_id));
       }
-      drop(cancellations);
 
       // Check current state for preemption logic
       if let Some(existing_id) = def.current_instance_id {
@@ -1102,60 +1098,97 @@ impl Coordinator {
     // Cannot efficiently find JobDefinition to clear its state.
   }
 
+  /// Cancels the job's currently **pending run** (if any).
+  ///
+  /// This is per-run cancellation: the lineage itself is not removed or halted. For a
+  /// recurring schedule the next occurrence is computed and scheduled immediately, so the
+  /// job keeps running on its schedule — only the pending run is skipped. For `Once` /
+  /// `Never` schedules there is no next occurrence; the definition simply remains
+  /// registered until `delete_job` reclaims it.
+  ///
+  /// A run that has already been dispatched to a worker is not affected (cancellation
+  /// never stops an executing instance).
   async fn handle_cancel_job_internal(&mut self, job_id: TKJobId) -> Result<(), QueryError> {
-    let mut should_wake_timer = false;
-    let mut instance_id_to_remove_opt = None;
-    let mut already_cancelled = true;
+    // Phase 1: validate the lineage and inspect its pending instance.
+    let (old_instance_opt, old_next_run) = {
+      let definitions = self.state.job_definitions.read();
+      let def = definitions.get(&job_id).ok_or_else(|| {
+        warn!(%job_id, "Attempted to cancel non-existent job.");
+        QueryError::JobNotFound(job_id)
+      })?;
+      (def.current_instance_id, def.request.next_run)
+    };
 
-    if let Some(def) = self.state.job_definitions.write().get_mut(&job_id) {
-      let mut cancellations_guard = self.state.cancellations.write();
-      already_cancelled = !cancellations_guard.insert(job_id);
-      if !already_cancelled {
-        trace!(%job_id, "Marked job lineage as cancelled.");
-        def.request.next_run = None;
-        instance_id_to_remove_opt = def.current_instance_id.take();
+    let Some(old_instance) = old_instance_opt else {
+      debug!(%job_id, "Cancel requested but no run is pending; nothing to cancel.");
+      return Ok(());
+    };
 
-        self
-          .state
-          .metrics
-          .jobs_lineage_cancelled
-          .fetch_add(1, AtomicOrdering::Relaxed);
-      } else {
-        debug!(%job_id, "Job was already marked as cancelled.");
+    // Phase 2: remove the pending instance from the queue.
+    if self.state.pq_type == PriorityQueueType::HandleBased {
+      if !self.pq.remove(&old_instance).await {
+        // Not in the queue: the instance was already dispatched and is executing.
+        // Its natural completion will schedule the next occurrence as usual.
+        debug!(%job_id, %old_instance, "Cancel requested but run already dispatched; not cancelled.");
+        return Ok(());
       }
-
-      drop(cancellations_guard);
-    } else {
-      warn!(%job_id, "Attempted to cancel non-existent job.");
-      return Err(QueryError::JobNotFound(job_id));
     }
+    // BinaryHeap: the instance cannot be removed proactively; dropping its mapping below
+    // turns it into a ghost that is discarded when it surfaces from the queue.
+    self.state.instance_to_lineage.write().remove(&old_instance);
 
-    if !already_cancelled {
-      if self.state.pq_type == PriorityQueueType::HandleBased {
-        if let Some(instance_id_to_remove) = instance_id_to_remove_opt {
-          self.state.instance_to_lineage.write().remove(&instance_id_to_remove);
-
-          if self.pq.remove(&instance_id_to_remove).await {
-            trace!(%job_id, %instance_id_to_remove, "Proactively removed cancelled instance.");
-            should_wake_timer = true;
-          } else {
-            trace!(%job_id, %instance_id_to_remove, "Instance to remove for cancellation not found in PQ.");
+    // Phase 3: schedule the next occurrence (recurring schedules only), skipping the
+    // cancelled run. Reference from the cancelled run's time (or now, if it was overdue).
+    let now = Utc::now();
+    let reference = old_next_run.map_or(now, |t| t.max(now));
+    let new_instance_id = Uuid::new_v4();
+    let next_run_opt = {
+      let mut definitions = self.state.job_definitions.write();
+      match definitions.get_mut(&job_id) {
+        Some(def) => {
+          if def.current_instance_id == Some(old_instance) {
+            def.current_instance_id = None;
           }
+          def.request.retry_count = 0;
+          let next = def.request.schedule.calculate_next_run(reference);
+          def.request.next_run = next;
+          if next.is_some() {
+            def.current_instance_id = Some(new_instance_id);
+          }
+          next
         }
+        None => None,
       }
-    }
+    };
 
-    if should_wake_timer {
-      self.try_wake_timer();
+    self
+      .state
+      .metrics
+      .jobs_lineage_cancelled
+      .fetch_add(1, AtomicOrdering::Relaxed);
+    trace!(%job_id, %old_instance, "Cancelled pending run.");
+
+    if let Some(next_run) = next_run_opt {
+      self.state.instance_to_lineage.write().insert(new_instance_id, job_id);
+      self.pq.push(new_instance_id, next_run).await;
+      debug!(%job_id, %new_instance_id, next_run = %next_run, "Scheduled next occurrence after cancelled run.");
     }
+    self.try_wake_timer();
 
     Ok(())
   }
 
+  /// A lineage reports `is_cancelled` when it is halted: quarantined after a panic
+  /// (per-run cancellation does not mark the lineage). The legacy `cancellations` set is
+  /// still consulted for defensiveness.
+  fn is_lineage_halted(&self, lineage_id: &TKJobId) -> bool {
+    self.state.quarantined_jobs.read().contains(lineage_id)
+      || self.state.cancellations.read().contains(lineage_id)
+  }
+
   // Helper to avoid code duplication between Map and Cache checks
   fn map_definition_to_details(&self, def: &JobDefinition) -> JobDetails {
-    let cancellations = self.state.cancellations.read(); // Quick lock
-    let is_cancelled = cancellations.contains(&def.lineage_id);
+    let is_cancelled = self.is_lineage_halted(&def.lineage_id);
     JobDetails {
       id: def.lineage_id,
       name: def.request.name.clone(),
@@ -1203,8 +1236,7 @@ impl Coordinator {
   }
 
   fn map_definition_to_summary(&self, def: &JobDefinition) -> JobSummary {
-    let cancellations = self.state.cancellations.read();
-    let is_cancelled = cancellations.contains(&def.lineage_id);
+    let is_cancelled = self.is_lineage_halted(&def.lineage_id);
     JobSummary {
       id: def.lineage_id,
       name: def.request.name.clone(),

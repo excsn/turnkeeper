@@ -78,7 +78,9 @@ async fn run_cancellation_scenario(
       info!("  is_cancelled: {}", details.is_cancelled);
       info!("  next_run_time: {:?}", details.next_run_time);
       info!("  next_run_instance: {:?}", details.next_run_instance);
-      assert!(details.is_cancelled, "Job should be marked cancelled");
+      // Per-run cancel: the lineage itself is not marked cancelled; the pending Once run
+      // was skipped and (Once has no next occurrence) nothing remains scheduled.
+      assert!(!details.is_cancelled, "Per-run cancel must not mark the lineage");
 
       // Observation: With HandleBased, next_run_* might clear faster due to
       // proactive removal from PQ. With BinaryHeap, they might remain until
@@ -114,7 +116,7 @@ async fn run_cancellation_scenario(
   match scheduler.get_job_details(job_id).await {
     Ok(details) => {
       info!("Final Details: {:#?}", details);
-      assert!(details.is_cancelled, "Final state: Job should be cancelled");
+      assert!(!details.is_cancelled, "Final state: lineage is not marked cancelled");
       assert!(
         details.next_run_time.is_none(),
         "Final state: No next run time"

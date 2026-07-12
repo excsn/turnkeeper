@@ -84,28 +84,34 @@ async fn test_trigger_job_not_found() {
   scheduler.shutdown_graceful(None).await.unwrap();
 }
 
+/// Cancellation is per-run and does not halt the lineage: a job whose pending run was
+/// cancelled remains registered and can still be triggered manually.
 #[tokio::test]
-async fn test_trigger_job_cancelled() {
+async fn test_trigger_job_after_cancel_succeeds() {
   setup_tracing();
   let scheduler = build_scheduler(1, PriorityQueueType::BinaryHeap).unwrap();
+  let flag = Arc::new(AtomicBool::new(false));
 
-  // 1. Add and cancel job
-  let job_req = TKJobRequest::new("Trigger Cancelled", Schedule::Never, 0);
+  // 1. Add a job with a pending future run, then cancel that run.
+  let mut job_req = TKJobRequest::new("Trigger After Cancel", Schedule::Never, 0);
+  job_req.with_initial_run_time(Utc::now() + ChronoDuration::seconds(30));
   let job_id = scheduler
-    .add_job_async(job_req, job_fn!({ true }))
+    .add_job_async(job_req, job_exec_flag(flag.clone(), StdDuration::ZERO))
     .await
     .expect("Add job failed");
   tokio::time::sleep(StdDuration::from_millis(50)).await;
   scheduler.cancel_job(job_id).await.expect("Cancel failed");
   tokio::time::sleep(StdDuration::from_millis(50)).await; // Allow cancel processing
 
-  // 2. Attempt to trigger
-  let result = scheduler.trigger_job_now(job_id).await;
-
+  // 2. The lineage is not cancelled — manual trigger must succeed and the job must run.
+  scheduler
+    .trigger_job_now(job_id)
+    .await
+    .expect("Trigger after per-run cancel should succeed");
+  tokio::time::sleep(StdDuration::from_millis(300)).await;
   assert!(
-    matches!(result, Err(QueryError::TriggerFailedJobCancelled(id)) if id == job_id),
-    "Expected TriggerFailedJobCancelled error, got {:?}",
-    result
+    flag.load(Ordering::SeqCst),
+    "Manually triggered job should run after its pending run was cancelled"
   );
 
   scheduler.shutdown_graceful(None).await.unwrap();
