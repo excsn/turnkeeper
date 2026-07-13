@@ -195,6 +195,28 @@ impl Coordinator {
       // Update gauge metrics
       self.update_gauge_metrics().await;
 
+      // Adopt a pending shutdown signal *before* dispatching or supervising.
+      // `shutdown_graceful`/`shutdown_force` set the watch value before any worker
+      // reacts to it, but this loop's `select!` is `biased` and polls the supervisor
+      // branch (`worker_tasks.next()`) ahead of the shutdown branch. On shutdown the
+      // workers exit almost at once, so the coordinator can observe a terminated
+      // worker while `shutting_down` is still `None`. Without adopting the signal here
+      // it would (a) "respawn" that worker and (b) call `try_dispatch_jobs`, which
+      // blocks forever on `job_dispatch_tx.send().await` once every worker has exited
+      // (the coordinator's own `job_dispatch_rx` clone keeps the channel open, so the
+      // send never fails and the size-1 buffer never drains) — deadlocking graceful
+      // shutdown.
+      if self.shutting_down.is_none() {
+        if let Some(mode) = *self.state.shutdown_rx.borrow() {
+          self.shutting_down = Some(mode);
+          info!(mode=?mode, "Coordinator adopted shutdown signal.");
+          let _ = self.state.staging_rx.close();
+          if mode == ShutdownMode::Force {
+            break;
+          }
+        }
+      }
+
       if self.shutting_down != Some(ShutdownMode::Graceful) {
         self.try_dispatch_jobs().await;
       }
@@ -202,14 +224,34 @@ impl Coordinator {
 
       // Check for graceful exit condition *before* the next select.
       if self.shutting_down == Some(ShutdownMode::Graceful) {
+        // Reclaim any dispatches that were buffered but never picked up: on shutdown a
+        // worker breaks out of its loop (shutdown is biased first in its `select!`)
+        // without draining the dispatch channel, so an item the coordinator already
+        // handed off — and already counted in `active_workers_counter` — can be left
+        // orphaned in the buffer. Nothing would ever decrement the count for it, so the
+        // `active_count == 0` exit condition below could never be met and graceful
+        // shutdown would hang. The coordinator owns a `job_dispatch_rx` clone, so drain
+        // the buffer here and release the count for each undelivered dispatch.
+        while let Ok((inst, lin, _dt)) = self.state.job_dispatch_rx.try_recv() {
+          debug!(%inst, %lin, "Reclaiming undelivered dispatch during graceful shutdown.");
+          let prev = self.state.active_workers_counter.fetch_sub(1, AtomicOrdering::Relaxed);
+          self
+            .state
+            .metrics
+            .workers_active_current
+            .store(prev.saturating_sub(1), AtomicOrdering::Relaxed);
+          self.cleanup_instance_maps(inst, lin).await;
+        }
+
         let active_count = self.state.active_workers_counter.load(AtomicOrdering::Relaxed);
         if active_count == 0 {
           info!("Graceful shutdown: All workers are idle. Coordinator exiting.");
           break; // Exit the main loop.
         } else {
-          trace!(
-            "Graceful shutdown: Waiting for {} active worker(s) to finish.",
-            active_count
+          debug!(
+            active = active_count,
+            dispatch_buf = self.state.job_dispatch_rx.len(),
+            "Graceful shutdown: waiting for active worker(s) to finish."
           );
         }
       }
@@ -959,27 +1001,59 @@ impl Coordinator {
                 scheduled_at = %ready_dt,
                 "Attempting dispatch via channel."
             );
-            if let Err(e) = self
-              .state
-              .job_dispatch_tx
-              .send((ready_instance_id, lineage_id, ready_dt)) // Send IDs
-              .await
-            {
-              error!(
-                  %ready_instance_id, %lineage_id,
-                  "Failed to send job dispatch, channel closed? {:?}. Job lost!", e
-              );
-              // Decrement active count since dispatch failed
-              let prev = self.state.active_workers_counter.fetch_sub(1, AtomicOrdering::Relaxed);
-              self
-                .state
-                .metrics
-                .workers_active_current
-                .store(prev.saturating_sub(1), AtomicOrdering::Relaxed);
-              self.cleanup_instance_maps(ready_instance_id, lineage_id).await;
-              break; // Stop dispatching if channel closed
+            // Hand the dispatch off, but stay interruptible by a shutdown signal.
+            // The dispatch buffer is tiny (default 1) and the coordinator holds its own
+            // `job_dispatch_rx` clone, so `send().await` blocks until a worker takes the
+            // item and never fails with `Closed` on its own. On shutdown every worker
+            // exits without draining, so a plain blocking send here would wedge the
+            // coordinator forever (the graceful-shutdown deadlock). Select the send
+            // against the shutdown watch so the hand-off can be aborted. The sender is
+            // cloned so the `select!` doesn't borrow `self.state` twice.
+            let tx = self.state.job_dispatch_tx.clone();
+            let send_fut = tx.send((ready_instance_id, lineage_id, ready_dt));
+            tokio::pin!(send_fut);
+            let send_outcome = tokio::select! {
+              biased;
+              res = &mut send_fut => Some(res),
+              _ = self.state.shutdown_rx.changed() => None, // shutdown signaled mid-hand-off
+            };
+
+            match send_outcome {
+              // Successfully dispatched. Loop to check for more jobs.
+              Some(Ok(())) => {}
+              Some(Err(e)) => {
+                error!(
+                    %ready_instance_id, %lineage_id,
+                    "Failed to send job dispatch, channel closed? {:?}. Job lost!", e
+                );
+                // Decrement active count since dispatch failed
+                let prev = self.state.active_workers_counter.fetch_sub(1, AtomicOrdering::Relaxed);
+                self
+                  .state
+                  .metrics
+                  .workers_active_current
+                  .store(prev.saturating_sub(1), AtomicOrdering::Relaxed);
+                self.cleanup_instance_maps(ready_instance_id, lineage_id).await;
+                break; // Stop dispatching if channel closed
+              }
+              None => {
+                // Shutdown signaled while handing off. Undo the active-count increment
+                // for this never-delivered dispatch and stop; the main loop adopts the
+                // shutdown signal at the top of the next iteration and winds down.
+                debug!(
+                    %ready_instance_id, %lineage_id,
+                    "Shutdown signaled during dispatch hand-off; aborting dispatch."
+                );
+                let prev = self.state.active_workers_counter.fetch_sub(1, AtomicOrdering::Relaxed);
+                self
+                  .state
+                  .metrics
+                  .workers_active_current
+                  .store(prev.saturating_sub(1), AtomicOrdering::Relaxed);
+                self.cleanup_instance_maps(ready_instance_id, lineage_id).await;
+                break;
+              }
             }
-            // Successfully dispatched. Loop to check for more jobs.
           } else {
             // State inconsistency: Popped instance has no lineage mapping.
             warn!(

@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 
 ### Fixed
+- `shutdown_graceful` could hang under load: the coordinator adopted a shutdown signal only via a biased `select!` branch that terminating workers could starve, then wedged on a blocking dispatch hand-off or on a leaked active-worker count from an undelivered dispatch. The coordinator now adopts the signal at the top of its loop, aborts an in-flight dispatch hand-off on shutdown, and reclaims undelivered dispatches. (Regression exposed by the 1.2.9 supervision fix.)
 
 ### Security
 
